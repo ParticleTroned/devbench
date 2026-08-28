@@ -15,8 +15,22 @@ includes("xmake/cpp-mcp.lua")
 set_project("devbench")
 set_license("GPL-3.0")
 
+option("build_label")
+set_default("")
+set_showmenu(true)
+set_description("Metadata appended to the reported runtime version for local builds")
+option_end()
+
 local version = "1.15.1"
 local ver = version:split("%.")
+local build_label = get_config("build_label")
+local version_string = version
+if build_label and build_label ~= "" then
+    if not build_label:match("^[%w.%-]+$") then
+        raise("DEVBENCH_BUILD_LABEL must contain only letters, digits, dots, and hyphens")
+    end
+    version_string = version .. "+" .. build_label
+end
 set_version(version)
 
 -- defaults
@@ -94,7 +108,7 @@ add_shflags("/DEBUG", { force = true })
 set_configvar("VERSION_MAJOR", tonumber(ver[1]))
 set_configvar("VERSION_MINOR", tonumber(ver[2]))
 set_configvar("VERSION_PATCH", tonumber(ver[3]))
-set_configvar("VERSION_STRING", version)
+set_configvar("VERSION_STRING", version_string)
 
 -- commonlibsse-ng plugin (auto-generates the SKSE plugin declaration)
 add_rules("commonlibsse-ng.plugin", {
