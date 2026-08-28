@@ -82,9 +82,14 @@ the REST facade can share the MCP port.
 
 ```
 git submodule update --init --recursive
+xmake config --build_label=a790ec5 # optional local runtime identity
 xmake
 # auto-deploy: set SkyrimPluginTargets to ';'-separated game Data dirs before building
 ```
+
+`--build_label=a790ec5` appends `+a790ec5` to the declared runtime version
+without changing the numeric ABI build or claiming the next automated release
+version.
 
 ## Configuration
 
