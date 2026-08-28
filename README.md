@@ -86,6 +86,18 @@ xmake
 # auto-deploy: set SkyrimPluginTargets to ';'-separated game Data dirs before building
 ```
 
+## Versioning
+
+Every completed change receives a Git version tag. Breaking changes increment
+the major version, `feat` commits increment the minor version, and every other
+Conventional Commit type increments the patch version. Release-metadata commits
+do not consume another version.
+
+Stable `vMAJOR.MINOR.PATCH` tags belong only to commits on `main`. Commits on an
+unmerged feature branch use `vMAJOR.MINOR.PATCH-BRANCH.N` prerelease tags, with
+`N` increasing for every commit. This keeps parallel histories traceable
+without implying that one branch contains another branch's changes.
+
 ## Configuration
 
 Headless config (no in-game menu yet) at `Data/SKSE/Plugins/devbench/config.json` — read
