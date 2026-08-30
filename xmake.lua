@@ -21,7 +21,7 @@ set_showmenu(true)
 set_description("Metadata appended to the reported runtime version for local builds")
 option_end()
 
-local version = "1.15.1"
+local version = "1.15.2"
 local ver = version:split("%.")
 local build_label = get_config("build_label")
 local version_string = version
