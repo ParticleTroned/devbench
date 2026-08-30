@@ -1769,7 +1769,7 @@ namespace dvb
 							ToolContext stepCtx = a_ctx;
 							stepCtx.internal = true;  // scenario-driven — don't log each step (replay logs a summary)
 							const ToolResult tr = a_registry.Invoke(tool, args, stepCtx);
-							const bool embeddedFailure =
+							const bool       embeddedFailure =
 								tr.ok && ScenarioPolicy::IsEmbeddedToolFailure(tr.value);
 							r["ok"] = tr.ok && !embeddedFailure;
 							if (tr.ok && !embeddedFailure) {

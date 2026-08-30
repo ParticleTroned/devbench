@@ -14,7 +14,7 @@ TEST_CASE("scenario rejects embedded extension errors")
 	CHECK(dvb::ScenarioPolicy::IsEmbeddedToolFailure(result));
 	CHECK(dvb::ScenarioPolicy::EmbeddedToolErrorCode(result) == "invalid_target");
 	CHECK(dvb::ScenarioPolicy::EmbeddedToolErrorMessage(result) ==
-	      "qualification_wait requires object parameter 'target'");
+		  "qualification_wait requires object parameter 'target'");
 }
 
 TEST_CASE("scenario rejects explicit ok false receipts")
