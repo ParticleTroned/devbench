@@ -74,6 +74,9 @@ permissions:
 jobs:
   prepare:
     name: Resolve release
+    # Keep the reusable workflow for upstream parity, but disable every Nexus
+    # path in the maintained fork, including manual workflow dispatches.
+    if: github.repository == 'alandtse/devbench'
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
