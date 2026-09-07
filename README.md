@@ -257,6 +257,13 @@ HUD notifications confirm hotkey actions (record started, record stopped, replay
 
 ## Scripted tests
 
+On Skyrim VR, use `camera {"action":"freecam","on":true}` before `camera drive`,
+then `camera {"action":"freecam","on":false}` to restore the previous camera.
+VR requests complete on the main thread (`queued:false`); allow a rendered frame
+after driving before capturing. This path keeps native stereo rendering and does
+not change freeze time. The engine's console `tfc`/`ToggleFlyCam` activation still
+crashes in VR. See [VR free-camera behavior and validation](docs/vr-free-camera.md).
+
 The **`scenario`** tool runs a timed step list server-side and returns a per-step transcript —
 one call replaces hand-chained requests with frame-accurate timing. Each step is a `tool`
 dispatch (any registered tool), a fixed `wait`, an event-driven **`waitFor`**, or a state-poll
@@ -278,7 +285,7 @@ POST /api/tool/scenario          // MCP: tools/call name=scenario — identical 
     { "tool": "console", "args": { "command": "player.setangle z 180" } },
     { "wait": 3000 },
     { "tool": "console", "args": { "command": "player.setangle z 270" } },
-    { "tool": "console", "args": { "command": "tfc" } }  // free cam for a screenshot sweep
+    { "tool": "camera", "args": { "action": "freecam", "on": true } }  // free cam for a screenshot sweep
   ]
 }
 // -> { "ok": true, "stepsRun": 11, "elapsedMs": 14213,

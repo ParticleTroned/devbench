@@ -14,10 +14,12 @@
 #include "Server.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
+#include "VRFreeCamera.h"
 #include "Version.h"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -1180,7 +1182,9 @@ namespace dvb
 						pov = "third";
 					else if (cam->currentState && cam->currentState->id == RE::CameraState::kAutoVanity)
 						pov = "vanity";  // kAutoVanity=1 is identical in SE/VR layouts
-					json out{ { "pov", pov }, { "freeCam", cam->IsInFreeCameraMode() } };
+					json out{ { "pov", pov }, { "freeCam", cam->IsInFreeCameraMode() },
+						{ "stateId", cam->currentState ? json(static_cast<std::uint32_t>(cam->currentState->id)) : json(nullptr) },
+						{ "freeCamBackend", REL::Module::IsVR() ? "vr-state" : "engine" } };
 					if (cam->cameraRoot) {
 						const auto& t = cam->cameraRoot->world.translate;
 						out["camX"] = t.x;
@@ -1198,10 +1202,15 @@ namespace dvb
 			if (!task)
 				throw ToolError(500, "SKSE TaskInterface unavailable");
 
-			// freecam: toggle the free camera. Enter before 'drive' (the state change is deferred a
-			// tick, so issue freecam {on:true} + a short wait before driving).
+			// VR transitions complete on the main thread; flat-game toggles remain deferred.
 			if (action == "freecam") {
 				const bool on = a_args.value("on", true);
+				if (REL::Module::IsVR()) {
+					return MainThread::RunAndWait([on]() {
+						VRFreeCamera::SetEnabled(on);
+						return json{ { "queued", false }, { "action", "freecam" }, { "on", on }, { "freeCam", on } };
+					});
+				}
 				task->AddTask([on]() {
 					if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->IsInFreeCameraMode() != on)
 						cam->ToggleFreeCameraMode(false);  // false: don't freeze time
@@ -1215,6 +1224,20 @@ namespace dvb
 			if (action == "drive") {
 				const float x = a_args.value("x", 0.0f), y = a_args.value("y", 0.0f), z = a_args.value("z", 0.0f);
 				const float pitch = a_args.value("pitch", 0.0f), yaw = a_args.value("yaw", 0.0f);
+				if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(pitch) || !std::isfinite(yaw))
+					throw ToolError(400, "camera drive requires finite coordinates and angles");
+				if (REL::Module::IsVR()) {
+					return MainThread::RunAndWait([x, y, z, pitch, yaw]() {
+						auto* cam = RE::PlayerCamera::GetSingleton();
+						if (!cam || !cam->IsInFreeCameraMode())
+							throw ToolError(409, "camera drive requires camera freecam on=true first");
+						auto* fc = static_cast<RE::FreeCameraState*>(cam->currentState.get());
+						fc->translation = RE::NiPoint3{ x, y, z };
+						fc->rotation.x = pitch;
+						fc->rotation.y = yaw;
+						return json{ { "queued", false }, { "action", "drive" } };
+					});
+				}
 				task->AddTask([x, y, z, pitch, yaw]() {
 					auto* cam = RE::PlayerCamera::GetSingleton();
 					if (!cam || !cam->currentState || cam->currentState->id != RE::CameraState::kFree)
@@ -2087,15 +2110,18 @@ namespace dvb
 		camera.name = "camera";
 		camera.description =
 			"Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, "
-			"camY, camZ, camPitch, camYaw } read live on the main thread, where pov is first | "
+			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend } read live on the main thread, where pov is first | "
 			"third | vanity | other. action='setPov' applies a switch (param 'pov': first | third "
 			"| vanity) on the main thread and returns { pov: <applied>, requestedPov } read back "
 			"the same tick — Skyrim's idle-vanity timer can still override it a few ticks later "
 			"while the player is stationary, so poll action='get' if you need certainty after "
-			"idling. action='freecam' (param 'on', default true) queues toggling free-camera mode "
-			"(fire-and-forget, takes effect a tick later) — poll action='get'.freeCam until true "
-			"before 'drive'. action='drive' (params 'x','y','z','pitch','yaw', all default 0) "
+			"idling. action='freecam' (param 'on', default true) enables or disables free camera. "
+			"On VR, freeCamBackend='vr-state': activation and restoration complete before return "
+			"(queued=false), using the existing VR state without changing freeze time. On SE/AE "
+			"the native toggle is queued; poll action='get'.freeCam before 'drive'. "
+			"action='drive' (params 'x','y','z','pitch','yaw', all default 0) "
 			"sets the free camera's world transform — requires free-cam mode already on. "
+			"VR drive completes its field writes before return; allow a rendered frame before capture. "
 			"Recordings capture the POV per sample and replay restores it via this tool, since "
 			"what is rendered (and benchmarked) differs by POV.";
 		camera.inputSchema = json{
@@ -2107,8 +2133,8 @@ namespace dvb
 								{ "x", json{ { "type", "number" }, { "description", "drive: world X (requires free-cam mode)" } } },
 								{ "y", json{ { "type", "number" }, { "description", "drive: world Y (requires free-cam mode)" } } },
 								{ "z", json{ { "type", "number" }, { "description", "drive: world Z (requires free-cam mode)" } } },
-								{ "pitch", json{ { "type", "number" }, { "description", "drive: free-cam pitch" } } },
-								{ "yaw", json{ { "type", "number" }, { "description", "drive: free-cam yaw" } } },
+								{ "pitch", json{ { "type", "number" }, { "description", "drive: native free-cam pitch in radians" } } },
+								{ "yaw", json{ { "type", "number" }, { "description", "drive: native free-cam yaw in radians" } } },
 							} },
 		};
 		a_registry.Register(std::move(camera), &CameraHandler);
