@@ -139,7 +139,7 @@ Missing → auto-created with defaults. Invalid → defaults (logged). All keys 
   // "health.stalled" EventBus event (and "health.resumed" once it recovers) — catches a
   // frozen main thread, which a menu/lifecycle event can never report on its own (those are
   // published BY the main thread). 0 disables the watchdog.
-  "stallWatchdogMs": 5000,
+  "stallWatchdogMs": 5000
 }
 ```
 
@@ -260,9 +260,11 @@ HUD notifications confirm hotkey actions (record started, record stopped, replay
 On Skyrim VR, use `camera {"action":"freecam","on":true}` before `camera drive`,
 then `camera {"action":"freecam","on":false}` to restore the previous camera.
 VR requests complete on the main thread (`queued:false`); allow a rendered frame
-after driving before capturing. This path keeps native stereo rendering and does
-not change freeze time. The engine's console `tfc`/`ToggleFlyCam` activation still
-crashes in VR. See [VR free-camera behavior and validation](docs/vr-free-camera.md).
+after driving before capturing. This path uses the native camera update pipeline
+and does not change freeze time; rendered stereo still needs in-game qualification.
+Unpatched engine console `tfc`/`ToggleFlyCam` activation still crashes in VR.
+Use DevBench for the whole enable/drive/disable sequence; externally activated
+free cameras are rejected. See [VR free-camera behavior and validation](docs/vr-free-camera.md).
 
 The **`scenario`** tool runs a timed step list server-side and returns a per-step transcript —
 one call replaces hand-chained requests with frame-accurate timing. Each step is a `tool`
