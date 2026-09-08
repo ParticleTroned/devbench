@@ -1,9 +1,9 @@
 """Opt-in VR free-camera regression test against a running, repaired DevBench.
 
 Set DEVBENCH_TEST_FREECAM=1 and DEVBENCH_URL to the intended test instance.
-The default skip happens before server discovery or player bootstrap. Even when
-enabled, the backend marker is checked before any camera mutation, so an older
-build cannot accidentally enter Skyrim VR's crashing native toggle.
+The default skip happens before server discovery. An explicit URL and an already
+loaded scene are required. The process identity and backend marker are rechecked
+before every mutation, including cleanup after a failed assertion.
 
 Run in a stationary, unobstructed scene without movement input. This checks the
 camera-node transform after subsequent game frames; visually inspect both eyes
@@ -17,18 +17,70 @@ import os
 import time
 
 import pytest
+import requests
 
 from conftest import require_enum, require_tool
 
 
 pytestmark = pytest.mark.skipif(
-    os.environ.get("DEVBENCH_TEST_FREECAM") != "1",
-    reason="set DEVBENCH_TEST_FREECAM=1 to run the VR free-camera round trip",
+    os.environ.get("DEVBENCH_TEST_FREECAM") != "1" or not os.environ.get("DEVBENCH_URL"),
+    reason="set DEVBENCH_TEST_FREECAM=1 and DEVBENCH_URL to the intended VR instance",
 )
 
 
+class _CameraSession:
+    """Stop mutations permanently after an identity/backend/liveness failure.
+
+    HTTP health and camera reads cannot make the following write atomic, but they
+    prevent a detected restart from sending cleanup into a replacement process.
+    """
+
+    def __init__(self, client, health):
+        self.client = client
+        self.pid = health["pid"]
+        self.frame = health["frame"]
+        self.usable = True
+
+    def health(self):
+        assert self.usable, "camera session is no longer safe to mutate"
+        try:
+            health = self.client.ok("inspect", {"kind": "health"})
+            assert health.get("vr") is True, health
+            assert health["pid"] == self.pid, "game instance changed during camera test"
+            assert health["frame"] >= self.frame, "game frame counter moved backwards"
+            self.frame = health["frame"]
+            return health
+        except (AssertionError, AttributeError, KeyError, TypeError, requests.RequestException):
+            self.usable = False
+            raise
+
+    def camera(self):
+        self.health()
+        try:
+            camera = self.client.ok("camera", {"action": "get"})
+            assert camera.get("freeCamBackend") == "vr-state", camera
+        except (AssertionError, AttributeError, requests.RequestException):
+            self.usable = False
+            raise
+        self.health()
+        return camera
+
+    def call(self, args):
+        self.camera()
+        return self.client.call("camera", args)
+
+    def ok(self, args):
+        status, result = self.call(args)
+        assert status == 200, (status, result)
+        return result
+
+    def cleanup(self):
+        if self.usable:
+            _set_freecam(self, False)
+
+
 @pytest.fixture
-def vr_camera_session(client, tool_schema, request):
+def vr_camera_session(client, tool_schema):
     camera = require_tool(tool_schema, "camera")
     for action in ("get", "freecam", "drive"):
         require_enum(camera, "action", action)
@@ -36,48 +88,47 @@ def vr_camera_session(client, tool_schema, request):
     for kind in ("health", "scene"):
         require_enum(inspect, "kind", kind)
 
+    health = client.ok("inspect", {"kind": "health"})
     initial = client.ok("camera", {"action": "get"})
     if initial.get("freeCamBackend") != "vr-state":
         pytest.skip("this instance does not advertise the repaired vr-state backend")
 
-    # Deliberately resolve this only after the safe backend read. Unlike the
-    # requires_player marker, it cannot bootstrap an unrecognized build first.
-    request.getfixturevalue("requires_player")
-    initial = client.ok("camera", {"action": "get"})
-    assert initial.get("freeCamBackend") == "vr-state", initial
+    session = _CameraSession(client, health)
+    initial = session.camera()
     if initial.get("freeCam") is True:
         pytest.skip("free camera is already active; preserve its existing owner/view")
     assert initial.get("freeCam") is False, initial
+    assert initial.get("freeCamOwned") is False, initial
     assert type(initial.get("stateId")) is int, initial
     assert initial["stateId"] != 3, initial
-    health = client.ok("inspect", {"kind": "health"})
-    assert health.get("vr") is True, health
-    return initial, health["pid"]
+    scene = client.ok("inspect", {"kind": "scene"})
+    if scene.get("playerLoaded") is not True:
+        pytest.skip("load a stationary scene before running the free-camera test")
+    return initial, session
 
 
-def _after_frames(client, pid, count=3):
-    start = client.ok("inspect", {"kind": "health"})
-    assert start["pid"] == pid, start
+def _after_frames(session, count=3):
+    start = session.health()
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
-        health = client.ok("inspect", {"kind": "health"})
-        assert health["pid"] == pid, "game instance changed during camera test"
+        health = session.health()
         if health["frame"] >= start["frame"] + count:
-            return client.ok("camera", {"action": "get"})
+            return session.camera()
         time.sleep(0.05)
+    session.usable = False
     pytest.fail(f"game frames stopped advancing after {start['frame']}")
 
 
-def _set_freecam(client, on):
-    result = client.ok("camera", {"action": "freecam", "on": on})
+def _set_freecam(session, on):
+    result = session.ok({"action": "freecam", "on": on})
     assert result.get("queued") is False, result
     assert result.get("action") == "freecam", result
     assert result.get("on") is on, result
     assert result.get("freeCam") is on, result
 
 
-def _drive(client, position, pitch, yaw):
-    result = client.ok("camera", {
+def _drive(session, position, pitch, yaw):
+    result = session.ok({
         "action": "drive",
         "x": position[0], "y": position[1], "z": position[2],
         "pitch": pitch, "yaw": yaw,
@@ -101,20 +152,30 @@ def _angle_distance(a, b):
     return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
 
 
-def test_vr_drive_requires_free_camera(client, vr_camera_session):
-    initial, _ = vr_camera_session
-    status, result = client.call("camera", {
+def test_vr_drive_requires_free_camera(vr_camera_session):
+    initial, session = vr_camera_session
+    status, result = session.call({
         "action": "drive", "x": 100.0, "y": 50.0, "z": 25.0,
         "pitch": 0.15, "yaw": 0.25,
     })
     assert status == 409, (status, result)
-    current = client.ok("camera", {"action": "get"})
+    current = session.camera()
+    assert current["stateId"] == initial["stateId"], current
+    assert current["freeCam"] is False, current
+
+
+@pytest.mark.parametrize("field", ["x", "y", "z", "pitch", "yaw"])
+def test_vr_drive_rejects_float_overflow(vr_camera_session, field):
+    initial, session = vr_camera_session
+    status, result = session.call({"action": "drive", field: 1e39})
+    assert status == 400, (status, result)
+    current = session.camera()
     assert current["stateId"] == initial["stateId"], current
     assert current["freeCam"] is False, current
 
 
 def test_vr_free_camera_drive_persists_and_restores(client, vr_camera_session):
-    initial, pid = vr_camera_session
+    initial, session = vr_camera_session
     scene = client.ok("inspect", {"kind": "scene"})
     assert scene.get("playerLoaded") is True, scene
     player_position = scene["position"]
@@ -122,15 +183,16 @@ def test_vr_free_camera_drive_persists_and_restores(client, vr_camera_session):
 
     try:
         for cycle in range(3):
-            _set_freecam(client, True)
-            _set_freecam(client, True)  # Must not replace the retained return state.
-            active = _after_frames(client, pid)
+            _set_freecam(session, True)
+            _set_freecam(session, True)  # Must not replace the retained return state.
+            active = _after_frames(session)
             assert active["freeCam"] is True and active["stateId"] == 3, active
+            assert active["freeCamOwned"] is True, active
 
             # Establish a known orientation before testing combined pitch/yaw;
             # world Euler readback need not equal native free-camera angles.
-            _drive(client, initial_position, pitch=0.0, yaw=0.0)
-            baseline = _after_frames(client, pid)
+            _drive(session, initial_position, pitch=0.0, yaw=0.0)
+            baseline = _after_frames(session)
             _assert_position(baseline, initial_position)
             baseline_angles = _angles(baseline)
 
@@ -139,15 +201,22 @@ def test_vr_free_camera_drive_persists_and_restores(client, vr_camera_session):
                 initial_position[1] + 25.0,
                 initial_position[2] + 15.0,
             ]
-            _drive(client, target, pitch=0.15, yaw=0.25)
-            driven = _after_frames(client, pid)
+            _drive(session, target, pitch=0.0, yaw=0.25)
+            yaw_only = _after_frames(session)
+            _assert_position(yaw_only, target)
+            yaw_angles = _angles(yaw_only)
+            assert _angle_distance(baseline_angles[1], yaw_angles[1]) > 0.05, (baseline, yaw_only)
+            assert _angle_distance(baseline_angles[0], yaw_angles[0]) < 0.01, (baseline, yaw_only)
+
+            _drive(session, target, pitch=0.15, yaw=0.25)
+            driven = _after_frames(session)
             assert driven["freeCam"] is True and driven["stateId"] == 3, driven
+            assert driven["freeCamOwned"] is True, driven
             _assert_position(driven, target)
             driven_angles = _angles(driven)
-            for before, after in zip(baseline_angles, driven_angles):
-                assert _angle_distance(before, after) > 0.05, (baseline, driven)
+            assert _angle_distance(yaw_angles[0], driven_angles[0]) > 0.05, (yaw_only, driven)
 
-            held = _after_frames(client, pid, count=12)
+            held = _after_frames(session, count=12)
             _assert_position(held, target)
             for before, after in zip(driven_angles, _angles(held)):
                 assert _angle_distance(before, after) < 0.01, (driven, held)
@@ -156,12 +225,11 @@ def test_vr_free_camera_drive_persists_and_restores(client, vr_camera_session):
                 player_position, abs=0.25, rel=0,
             ), current_scene
 
-            _set_freecam(client, False)
-            _set_freecam(client, False)
-            restored = _after_frames(client, pid)
+            _set_freecam(session, False)
+            _set_freecam(session, False)
+            restored = _after_frames(session)
             assert restored["freeCam"] is False, restored
+            assert restored["freeCamOwned"] is False, restored
             assert restored["stateId"] == initial["stateId"], (initial, restored)
     finally:
-        # The backend and initial inactive state were validated before entering
-        # this block. Cleanup therefore cannot toggle an old native VR build.
-        client.ok("camera", {"action": "freecam", "on": False})
+        session.cleanup()

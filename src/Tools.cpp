@@ -1328,6 +1328,7 @@ namespace dvb
 					else if (cam->currentState && cam->currentState->id == RE::CameraState::kAutoVanity)
 						pov = "vanity";  // kAutoVanity=1 is identical in SE/VR layouts
 					json out{ { "pov", pov }, { "freeCam", cam->IsInFreeCameraMode() },
+						{ "freeCamOwned", VRFreeCamera::IsOwned() },
 						{ "stateId", cam->currentState ? json(static_cast<std::uint32_t>(cam->currentState->id)) : json(nullptr) },
 						{ "freeCamBackend", REL::Module::IsVR() ? "vr-state" : "engine" } };
 					if (cam->cameraRoot) {
@@ -1351,8 +1352,9 @@ namespace dvb
 			if (action == "freecam") {
 				const bool on = a_args.value("on", true);
 				if (REL::Module::IsVR()) {
-					return MainThread::RunAndWait([on]() {
-						VRFreeCamera::SetEnabled(on);
+					const auto session = VRFreeCamera::CurrentSession();
+					return MainThread::RunAndWait([on, session]() {
+						VRFreeCamera::SetEnabled(on, session);
 						return json{ { "queued", false }, { "action", "freecam" }, { "on", on }, { "freeCam", on } };
 					});
 				}
@@ -1372,14 +1374,9 @@ namespace dvb
 				if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(pitch) || !std::isfinite(yaw))
 					throw ToolError(400, "camera drive requires finite coordinates and angles");
 				if (REL::Module::IsVR()) {
-					return MainThread::RunAndWait([x, y, z, pitch, yaw]() {
-						auto* cam = RE::PlayerCamera::GetSingleton();
-						if (!cam || !cam->IsInFreeCameraMode())
-							throw ToolError(409, "camera drive requires camera freecam on=true first");
-						auto* fc = static_cast<RE::FreeCameraState*>(cam->currentState.get());
-						fc->translation = RE::NiPoint3{ x, y, z };
-						fc->rotation.x = pitch;
-						fc->rotation.y = yaw;
+					const auto session = VRFreeCamera::CurrentSession();
+					return MainThread::RunAndWait([x, y, z, pitch, yaw, session]() {
+						VRFreeCamera::Drive(x, y, z, pitch, yaw, session);
 						return json{ { "queued", false }, { "action", "drive" } };
 					});
 				}
@@ -2262,7 +2259,7 @@ namespace dvb
 		camera.name = "camera";
 		camera.description =
 			"Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, "
-			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend } read live on the main thread, where pov is first | "
+			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned } read live on the main thread, where pov is first | "
 			"third | vanity | other. action='setPov' applies a switch (param 'pov': first | third "
 			"| vanity) on the main thread and returns { pov: <applied>, requestedPov } read back "
 			"the same tick — Skyrim's idle-vanity timer can still override it a few ticks later "
@@ -2273,6 +2270,7 @@ namespace dvb
 			"the native toggle is queued; poll action='get'.freeCam before 'drive'. "
 			"action='drive' (params 'x','y','z','pitch','yaw', all default 0) "
 			"sets the free camera's world transform — requires free-cam mode already on. "
+			"VR enable, disable, and drive reject an active camera owned elsewhere; freeCamOwned reports devbench ownership. "
 			"VR drive completes its field writes before return; allow a rendered frame before capture. "
 			"Recordings capture the POV per sample and replay restores it via this tool, since "
 			"what is rendered (and benchmarked) differs by POV.";
