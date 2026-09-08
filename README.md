@@ -139,7 +139,7 @@ Missing → auto-created with defaults. Invalid → defaults (logged). All keys 
   // "health.stalled" EventBus event (and "health.resumed" once it recovers) — catches a
   // frozen main thread, which a menu/lifecycle event can never report on its own (those are
   // published BY the main thread). 0 disables the watchdog.
-  "stallWatchdogMs": 5000
+  "stallWatchdogMs": 5000,
 }
 ```
 
