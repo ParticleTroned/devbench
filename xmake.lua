@@ -31,6 +31,13 @@ add_rules("mode.debug", "mode.releasedbg")
 set_defaultmode("releasedbg")
 add_rules("plugin.vsxmake.autoupdate")
 
+-- Fork metadata is independent from the upstream numeric version.
+option("build_label")
+set_default("")
+set_showmenu(true)
+set_description("Metadata appended to the reported runtime version for local builds")
+option_end()
+
 -- packages
 add_requires("nlohmann_json")
 -- Decode-only image loading for the `capture` tool's native SSIM comparison (two already-
@@ -103,6 +110,24 @@ set_configvar("VERSION_MAJOR", tonumber(ver[1]))
 set_configvar("VERSION_MINOR", tonumber(ver[2]))
 set_configvar("VERSION_PATCH", tonumber(ver[3]))
 set_configvar("VERSION_STRING", version)
+-- Reevaluate metadata on ordinary incremental builds after FORK_VERSION changes.
+set_policy("build.always_update_configfiles", true)
+on_load(function(target)
+    import("core.project.config")
+    local fork_version = io.readfile(path.join(os.projectdir(), "FORK_VERSION")):trim()
+    if not fork_version:match("^%d+%.%d+%.%d+$") then
+        raise("FORK_VERSION must contain a major.minor.patch version")
+    end
+    local version_string = target:version() .. "+pt." .. fork_version
+    local build_label = config.get("build_label")
+    if build_label and build_label ~= "" then
+        if not build_label:match("^[%w.%-]+$") then
+            raise("build_label must contain only letters, digits, dots, and hyphens")
+        end
+        version_string = version_string .. "." .. build_label
+    end
+    target:set("configvar", "VERSION_STRING", version_string)
+end)
 
 -- commonlibsse-ng plugin (auto-generates the SKSE plugin declaration)
 add_rules("commonlibsse-ng.plugin", {

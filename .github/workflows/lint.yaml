@@ -31,6 +31,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
+      - run: node --test tests/fork-release.test.cjs
       - run: npm ci
         working-directory: bridge
 
