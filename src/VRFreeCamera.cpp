@@ -50,18 +50,23 @@ namespace dvb::VRFreeCamera
 			return state;
 		}
 
+		void ReconcileLoadRecovery(RE::PlayerCamera* a_camera)
+		{
+			if (a_camera && a_camera->currentState && a_camera->currentState->id != RE::CameraState::kFree)
+				g_loadRecoveryPending = false;
+		}
+
 		bool RecoverAfterLoad()
 		{
 			if (!g_loadRecoveryPending)
 				return true;
 			auto* camera = RE::PlayerCamera::GetSingleton();
+			ReconcileLoadRecovery(camera);
+			if (!g_loadRecoveryPending)
+				return true;
 			auto* data = camera ? camera->GetVRRuntimeData() : nullptr;
 			if (!data || !camera->currentState)
 				return false;
-			if (camera->currentState->id != RE::CameraState::kFree) {
-				g_loadRecoveryPending = false;
-				return true;
-			}
 
 			// Reacquire the loaded scene's normal VR state; no pre-load pointers survive.
 			const auto freeState = data->cameraStates[RE::CameraState::kFree];
@@ -88,6 +93,7 @@ namespace dvb::VRFreeCamera
 		if (!REL::Module::IsVR())
 			return false;
 		auto* camera = RE::PlayerCamera::GetSingleton();
+		ReconcileLoadRecovery(camera);
 		auto* data = camera ? camera->GetVRRuntimeData() : nullptr;
 		if (!data || camera != g_owner || !g_freeState || camera->currentState != g_freeState ||
 			data->cameraStates[RE::CameraState::kFree] != g_freeState || !Registered(camera, g_previousState.get())) {
