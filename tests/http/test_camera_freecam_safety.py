@@ -51,6 +51,7 @@ class FakeClient:
         self.calls = []
         self.after_camera_read = None
         self.health_error = None
+        self.camera_error = None
 
     def ok(self, tool, args):
         self.calls.append((tool, args.copy()))
@@ -68,6 +69,8 @@ class FakeClient:
     def call(self, tool, args):
         self.calls.append((tool, args.copy()))
         assert tool == "camera"
+        if self.camera_error is not None:
+            return self.camera_error
         if args["action"] == "freecam":
             self.camera.update(freeCam=args["on"], freeCamOwned=args["on"], stateId=3 if args["on"] else 0)
             return 200, {"queued": False, "action": "freecam", "on": args["on"], "freeCam": args["on"]}
@@ -97,6 +100,33 @@ def test_same_instance_enable_and_cleanup(fake_client):
         {"action": "freecam", "on": False},
     ]
     assert fake_client.camera["freeCam"] is False
+
+
+def test_cleanup_ownership_loss_preserves_original_failure(fake_client):
+    session = _session(fake_client)
+    freecam._set_freecam(session, True)
+    fake_client.camera["freeCamOwned"] = False
+    fake_client.camera_error = (409, {"error": "preserve the existing camera owner"})
+
+    with pytest.raises(AssertionError, match="original camera assertion"):
+        try:
+            raise AssertionError("original camera assertion")
+        finally:
+            session.cleanup()
+
+    assert fake_client.camera["freeCam"] is True
+    assert fake_client.camera["freeCamOwned"] is False
+    assert fake_client.mutations == [
+        {"action": "freecam", "on": True},
+        {"action": "freecam", "on": False},
+    ]
+
+
+def test_cleanup_does_not_accept_unexpected_error(fake_client):
+    session = _session(fake_client)
+    fake_client.camera_error = (500, {"error": "unexpected cleanup failure"})
+    with pytest.raises(AssertionError, match="unexpected cleanup failure"):
+        session.cleanup()
 
 
 @pytest.mark.parametrize("change", ["pid", "frame", "vr", "backend", "unreachable"])
