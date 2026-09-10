@@ -6,18 +6,18 @@ DevBench's VR camera path enters the existing engine `FreeCameraState` directly.
 
 These findings come from preserved, decrypted **live mapped-memory images**, captured from running Skyrim VR processes on 2026-08-22 and 2026-08-25. The packed executable on disk was not the analysis input. Addresses below are RVAs relative to `SkyrimVR.exe`; raw images are not included in this repository.
 
-| RVA | Finding |
-| --- | --- |
-| `0x876880` | Native `ToggleFreeCameraMode`, correctly mapped by Address Library ID `49876`. |
+| RVA                   | Finding                                                                                                                                                                                                                    |
+| --------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0x876880`            | Native `ToggleFreeCameraMode`, correctly mapped by Address Library ID `49876`.                                                                                                                                             |
 | `0x8768C8`–`0x8768E2` | Activation sets `RAX=0x30`, clears `RCX`, then stores the source translation to absolute addresses `0x34`, `0x30`, and `0x38`. The first store, `movss [0x34], xmm1` at `0x8768CF`, matches the reported access violation. |
-| `0x8768EB`–`0x876905` | Activation also passes a null state to the rotation helper and omits the state switch. Replacing only the invalid stores would not complete activation. |
-| `0x876912` | The native function tests `freezeTime` after the invalid stores. Changing that argument cannot avoid the activation crash. |
-| `0x8757FD`–`0x8758C4` | The VR constructor allocates a `0x50`-byte `FreeCameraState`, initializes ID `3`, and stores it at `PlayerCamera+0xD8`: VR `cameraStates[3]`, whose array begins at `+0xC0`. |
-| `0x172CFC0` | Free-camera vtable: Begin `0x8738A0`, End `0x873950`, VR update thunk `0x209160`, Update `0x8739E0`, GetRotation `0x873AF0`, GetTranslation `0x873B30`. |
-| `0x873B50` | Native quaternion-to-free-camera rotation helper. It writes pitch at state `+0x3C` and yaw at `+0x40`; translation occupies `+0x30`–`+0x38`. |
-| `0x505F60` | `TESCamera::SetState`, Address Library ID `32290`. Calls the previous state's End, transfers the reference, then calls the new state's Begin. |
-| `0x72C030` | The VR mapping of CommonLib `PushCameraState` is a no-op stub. It cannot activate free camera. |
-| `0x878F10` | Native exit pops the engine's temporary return-state stack, falling back to first-person if empty. A replacement using its own retained return state must restore that state directly. |
+| `0x8768EB`–`0x876905` | Activation also passes a null state to the rotation helper and omits the state switch. Replacing only the invalid stores would not complete activation.                                                                    |
+| `0x876912`            | The native function tests `freezeTime` after the invalid stores. Changing that argument cannot avoid the activation crash.                                                                                                 |
+| `0x8757FD`–`0x8758C4` | The VR constructor allocates a `0x50`-byte `FreeCameraState`, initializes ID `3`, and stores it at `PlayerCamera+0xD8`: VR `cameraStates[3]`, whose array begins at `+0xC0`.                                               |
+| `0x172CFC0`           | Free-camera vtable: Begin `0x8738A0`, End `0x873950`, VR update thunk `0x209160`, Update `0x8739E0`, GetRotation `0x873AF0`, GetTranslation `0x873B30`.                                                                    |
+| `0x873B50`            | Native quaternion-to-free-camera rotation helper. It writes pitch at state `+0x3C` and yaw at `+0x40`; translation occupies `+0x30`–`+0x38`.                                                                               |
+| `0x505F60`            | `TESCamera::SetState`, Address Library ID `32290`. Calls the previous state's End, transfers the reference, then calls the new state's Begin.                                                                              |
+| `0x72C030`            | The VR mapping of CommonLib `PushCameraState` is a no-op stub. It cannot activate free camera.                                                                                                                             |
+| `0x878F10`            | Native exit pops the engine's temporary return-state stack, falling back to first-person if empty. A replacement using its own retained return state must restore that state directly.                                     |
 
 The native toggle's `0xC3` function bytes are identical across four preserved live images. This is an engine activation defect, not evidence of an NR setting or missing controller causing the crash.
 
