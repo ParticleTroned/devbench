@@ -439,3 +439,20 @@ TEST_CASE("VR camera load recovery never starts for an externally owned free cam
 	CHECK(scene.camera.currentState == scene.free);
 	CHECK(scene.camera.transitions == 0);
 }
+
+TEST_CASE("VR camera observation cancels pending recovery before a foreign free-camera entry")
+{
+	Scene scene;
+	scene.Enable();
+	scene.camera.rejectTransition = true;
+	Camera::BeginLoad();
+	Camera::EndLoad();
+	scene.camera.currentState = scene.other;
+	CHECK(!Camera::IsOwned());
+	scene.camera.currentState = scene.free;
+	scene.camera.rejectTransition = false;
+	const auto transitions = scene.camera.transitions;
+	ExpectError(409, [&] { scene.Enable(false); });
+	CHECK(scene.camera.currentState == scene.free);
+	CHECK(scene.camera.transitions == transitions);
+}
