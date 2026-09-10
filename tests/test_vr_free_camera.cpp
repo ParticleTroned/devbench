@@ -155,7 +155,6 @@ namespace
 		std::shared_ptr<Model::FreeCameraState> free = std::make_shared<Model::FreeCameraState>();
 		Scene()
 		{
-			Camera::EndLoad();
 			Model::PlayerCamera::singleton = &camera;
 			Model::PlayerCharacter::singleton = &player;
 			prior->camera = other->camera = free->camera = &camera;
@@ -166,9 +165,11 @@ namespace
 			camera.data.cameraStates[other->id] = other;
 			camera.data.cameraStates[free->id] = free;
 			camera.currentState = prior;
+			Camera::EndLoad();
 		}
 		~Scene()
 		{
+			camera.currentState = prior;
 			Camera::EndLoad();
 			Model::PlayerCamera::singleton = nullptr;
 			Model::PlayerCharacter::singleton = nullptr;
@@ -292,7 +293,7 @@ TEST_CASE("VR camera invalidates mutations at both save-load boundaries")
 	CHECK(!Camera::IsOwned());
 }
 
-TEST_CASE("VR camera transition failures do not claim success or restore across a load")
+TEST_CASE("VR camera transition failures retain safe restoration and recovery retries")
 {
 	Scene scene;
 	scene.camera.rejectTransition = true;
@@ -306,7 +307,11 @@ TEST_CASE("VR camera transition failures do not claim success or restore across 
 	Camera::BeginLoad();
 	CHECK(!Camera::IsOwned());
 	Camera::EndLoad();
-	ExpectError(409, [&] { scene.Enable(false); });
+	ExpectError(500, [&] { scene.Enable(false); });
+	scene.camera.rejectTransition = false;
+	scene.Enable(false);
+	CHECK(scene.camera.currentState == scene.prior);
+	CHECK(!Camera::IsOwned());
 }
 
 TEST_CASE("VR camera requires a loaded player and a registered source state")
@@ -319,4 +324,118 @@ TEST_CASE("VR camera requires a loaded player and a registered source state")
 	ExpectError(422, [&] { scene.Enable(); });
 	CHECK(scene.camera.transitions == 0);
 	CHECK(!Camera::IsOwned());
+}
+
+TEST_CASE("VR camera load recovery reacquires replacement scene states")
+{
+	Scene scene;
+	scene.Enable();
+	scene.camera.rejectTransition = true;
+	Camera::BeginLoad();
+	CHECK(!Camera::IsOwned());
+	CHECK(scene.prior.use_count() == 2);
+	CHECK(scene.free.use_count() == 3);
+	const std::weak_ptr<Model::TESCameraState>  oldPrior = scene.prior;
+	const std::weak_ptr<Model::FreeCameraState> oldFree = scene.free;
+	scene.prior = std::make_shared<Model::TESCameraState>();
+	scene.free = std::make_shared<Model::FreeCameraState>();
+	scene.prior->camera = scene.free->camera = &scene.camera;
+	scene.prior->id = Model::CameraState::kVR;
+	scene.free->id = Model::CameraState::kFree;
+	scene.camera.data.cameraStates[Model::CameraState::kVR] = scene.prior;
+	scene.camera.data.cameraStates[Model::CameraState::kFree] = scene.free;
+	scene.camera.currentState = scene.free;
+	CHECK(oldPrior.expired() && oldFree.expired());
+	scene.camera.rejectTransition = false;
+	Camera::EndLoad();
+	CHECK(scene.camera.currentState == scene.prior);
+	CHECK(!Camera::IsOwned());
+	scene.Enable();
+	scene.Enable(false);
+	CHECK(scene.camera.currentState == scene.prior);
+}
+
+TEST_CASE("VR camera load recovery waits for an available camera")
+{
+	Scene scene;
+	scene.Enable();
+	scene.camera.rejectTransition = true;
+	Camera::BeginLoad();
+	Model::PlayerCamera::singleton = nullptr;
+	Camera::EndLoad();
+	ExpectError(500, [&] { scene.Enable(false); });
+	Model::PlayerCamera::singleton = &scene.camera;
+	scene.camera.rejectTransition = false;
+	scene.Enable(false);
+	CHECK(scene.camera.currentState == scene.prior);
+}
+
+TEST_CASE("VR camera load recovery validates the current return-state registration")
+{
+	Scene scene;
+	scene.Enable();
+	scene.camera.rejectTransition = true;
+	Camera::BeginLoad();
+	scene.camera.rejectTransition = false;
+	scene.camera.data.cameraStates[Model::CameraState::kVR].reset();
+	const auto transitions = scene.camera.transitions;
+	Camera::EndLoad();
+	ExpectError(500, [&] { scene.Enable(false); });
+	scene.camera.data.cameraStates[Model::CameraState::kVR] = scene.other;
+	ExpectError(500, [&] { scene.Enable(false); });
+	scene.camera.data.cameraStates[Model::CameraState::kVR] = scene.prior;
+	scene.prior->camera = nullptr;
+	ExpectError(500, [&] { scene.Enable(false); });
+	CHECK(scene.camera.transitions == transitions);
+	scene.prior->camera = &scene.camera;
+	scene.Enable(false);
+	CHECK(scene.camera.currentState == scene.prior);
+}
+
+TEST_CASE("VR camera load recovery waits for a loaded scene and blocks stale requests")
+{
+	Scene scene;
+	scene.Enable();
+	scene.camera.rejectTransition = true;
+	Camera::BeginLoad();
+	const auto loadingSession = Camera::CurrentSession();
+	scene.camera.rejectTransition = false;
+	scene.player.loaded = false;
+	const auto transitions = scene.camera.transitions;
+	Camera::EndLoad();
+	ExpectError(500, [&] { scene.Enable(false); });
+	ExpectError(409, [&] { scene.Drive(); });
+	scene.player.loaded = true;
+	ExpectError(409, [&] { Camera::SetEnabled(false, loadingSession); });
+	CHECK(scene.camera.transitions == transitions);
+	scene.Enable(false);
+	CHECK(scene.camera.currentState == scene.prior);
+}
+
+TEST_CASE("VR camera load recovery preserves a camera already changed by loading")
+{
+	Scene scene;
+	scene.Enable();
+	scene.camera.rejectTransition = true;
+	Camera::BeginLoad();
+	scene.camera.rejectTransition = false;
+	scene.camera.currentState = scene.other;
+	const auto transitions = scene.camera.transitions;
+	Camera::EndLoad();
+	CHECK(scene.camera.currentState == scene.other);
+	CHECK(scene.camera.transitions == transitions);
+	scene.camera.currentState = scene.free;
+	ExpectError(409, [&] { scene.Enable(false); });
+	CHECK(scene.camera.transitions == transitions);
+}
+
+TEST_CASE("VR camera load recovery never starts for an externally owned free camera")
+{
+	Scene scene;
+	scene.camera.currentState = scene.free;
+	Camera::BeginLoad();
+	Camera::EndLoad();
+	ExpectError(409, [&] { scene.Enable(false); });
+	CHECK(scene.camera.currentState == scene.free);
+	CHECK(scene.camera.transitions == 0);
 }

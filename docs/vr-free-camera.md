@@ -35,6 +35,8 @@ Use DevBench for the complete enable/drive/disable sequence. `camera get` report
 
 Activation clears the free state's latched movement inputs, which the native Begin/End methods leave behind. Save loading blocks new free-camera mutations and invalidates commands queued for the previous scene. Main-thread work that has not started is abandoned after its deadline or caller cancellation. A callback already executing cannot be interrupted safely; a timeout reporting that case requires reading the camera state before deciding what to do next.
 
+If restoration is rejected before a save load, DevBench discards all retained camera pointers and retries using the loaded scene's registered normal VR state. It leaves a camera already changed by loading alone. If that recovery is also rejected or the scene is not ready, it logs the failure; a fresh `camera {"action":"freecam","on":false}` retries using current scene state and reports HTTP 500 until recovery succeeds. This recovery applies only after a failed restoration of a DevBench-owned camera.
+
 ## Relationship to an engine repair
 
 A complete native repair must initialize the actual free state, switch into it, and restore the correct prior state on exit. Guarding the invalid pointer alone does not supply the missing activation. If an engine-fix plugin provides that complete repair, this direct-state workaround is no longer required merely to prevent the native activation crash on that installation. DevBench's synchronous commands, ownership checks, lifecycle protection, diagnostics, and regression tests still serve its automation API. This implementation does not detect or depend on an engine-fix plugin and continues using its own backend when one is installed.

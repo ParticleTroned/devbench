@@ -331,7 +331,7 @@ one call replaces hand-chained requests with frame-accurate timing. Each step is
 dispatch (any registered tool), a fixed `wait`, an event-driven **`waitFor`**, or a state-poll
 `waitUntil`. **Prefer `waitFor`** — it keys off the _actual_ Skyrim event (a load is done when
 `lifecycle:postLoadGame` fires) rather than a guessed sleep. This is a validated battery — load,
-wait for the load event, settle, rotate in place, then free the camera:
+wait for the load event, settle, rotate in place, then enable and restore the camera:
 
 ```jsonc
 POST /api/tool/scenario          // MCP: tools/call name=scenario — identical body
@@ -347,10 +347,11 @@ POST /api/tool/scenario          // MCP: tools/call name=scenario — identical 
     { "tool": "console", "args": { "command": "player.setangle z 180" } },
     { "wait": 3000 },
     { "tool": "console", "args": { "command": "player.setangle z 270" } },
-    { "tool": "camera", "args": { "action": "freecam", "on": true } }  // free cam for a screenshot sweep
+    { "tool": "camera", "args": { "action": "freecam", "on": true } },
+    { "tool": "camera", "args": { "action": "freecam", "on": false } }
   ]
 }
-// -> { "ok": true, "stepsRun": 11, "elapsedMs": 14213,
+// -> { "ok": true, "stepsRun": 12, "elapsedMs": 14213,
 //      "results": [ { "index": 0, "kind": "tool", "ok": true, ... },
 //                   { "index": 1, "kind": "waitFor", "satisfied": true, "elapsedMs": 4870 }, ... ] }
 ```
