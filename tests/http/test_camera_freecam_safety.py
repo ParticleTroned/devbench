@@ -72,7 +72,10 @@ class FakeClient:
         if self.camera_error is not None:
             return self.camera_error
         if args["action"] == "freecam":
-            self.camera.update(freeCam=args["on"], freeCamOwned=args["on"], stateId=3 if args["on"] else 0)
+            self.camera.update(
+                freeCam=args["on"], freeCamOwned=args["on"],
+                stateId=freecam.VR_FREE_CAMERA_STATE_ID if args["on"] else 0,
+            )
             return 200, {"queued": False, "action": "freecam", "on": args["on"], "freeCam": args["on"]}
         assert args["action"] == "drive"
         return 200, {"queued": False, "action": "drive"}
@@ -185,13 +188,13 @@ def test_fixture_skips_unsuitable_scene_without_bootstrap_or_camera_mutation(fak
     if condition == "old_backend":
         fake_client.camera.pop("freeCamBackend")
     elif condition == "already_active":
-        fake_client.camera.update(freeCam=True, stateId=3)
+        fake_client.camera.update(freeCam=True, stateId=freecam.VR_FREE_CAMERA_STATE_ID)
     else:
         fake_client.scene["playerLoaded"] = False
 
     schema = {name: {} for name in ("camera", "inspect")}
     with pytest.raises(pytest.skip.Exception):
-        freecam.vr_camera_session.__wrapped__(fake_client, schema)
+        freecam._create_camera_session(fake_client, schema)
     assert fake_client.mutations == []
     assert all(tool in ("inspect", "camera") for tool, _ in fake_client.calls)
 
@@ -200,5 +203,5 @@ def test_fixture_detects_restart_during_initial_backend_check(fake_client):
     fake_client.after_camera_read = lambda: fake_client.health.update(pid=456)
     schema = {name: {} for name in ("camera", "inspect")}
     with pytest.raises(AssertionError, match="instance changed"):
-        freecam.vr_camera_session.__wrapped__(fake_client, schema)
+        freecam._create_camera_session(fake_client, schema)
     assert fake_client.mutations == []

@@ -2274,6 +2274,8 @@ namespace dvb
 			"VR pitch/yaw are native free-camera angles in radians; SE/AE writes them to "
 			"FreeCameraState::rotation using the existing best-effort convention. "
 			"VR enable, disable, and drive reject an active camera owned elsewhere; freeCamOwned reports devbench ownership. "
+			"After failed pre-load restoration, freecam off retries recovery using the loaded scene's normal VR state; "
+			"unavailable or rejected recovery returns HTTP 500. "
 			"VR drive completes its field writes before return; allow a rendered frame before capture. "
 			"Recordings capture the POV per sample and replay restores it via this tool, since "
 			"what is rendered (and benchmarked) differs by POV.";

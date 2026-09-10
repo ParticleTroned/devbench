@@ -13,6 +13,7 @@ namespace dvb::VRFreeCamera
 		RE::PlayerCamera*                       g_owner = nullptr;
 		std::atomic<SessionToken>               g_session{ 0 };
 		std::atomic<bool>                       g_loading{ false };
+		bool                                    g_loadRecoveryPending = false;
 
 		void Release()
 		{
@@ -48,6 +49,33 @@ namespace dvb::VRFreeCamera
 				throw ToolError(422, "VR free-camera state is unavailable");
 			return state;
 		}
+
+		bool RecoverAfterLoad()
+		{
+			if (!g_loadRecoveryPending)
+				return true;
+			auto* camera = RE::PlayerCamera::GetSingleton();
+			auto* data = camera ? camera->GetVRRuntimeData() : nullptr;
+			if (!data || !camera->currentState)
+				return false;
+			if (camera->currentState->id != RE::CameraState::kFree) {
+				g_loadRecoveryPending = false;
+				return true;
+			}
+
+			// Reacquire the loaded scene's normal VR state; no pre-load pointers survive.
+			const auto freeState = data->cameraStates[RE::CameraState::kFree];
+			const auto returnState = data->cameraStates[RE::CameraState::kVR];
+			auto*      player = RE::PlayerCharacter::GetSingleton();
+			if (camera->currentState != freeState || !Registered(camera, freeState.get()) ||
+				!Registered(camera, returnState.get()) || returnState->id != RE::CameraState::kVR ||
+				!camera->cameraRoot || !player || !player->Get3D() || !player->GetParentCell() ||
+				!RE::PlayerControls::GetSingleton())
+				return false;
+			camera->SetState(returnState.get());
+			g_loadRecoveryPending = camera->currentState == freeState;
+			return camera->currentState == returnState;
+		}
 	}
 
 	SessionToken CurrentSession()
@@ -74,6 +102,8 @@ namespace dvb::VRFreeCamera
 	void SetEnabled(bool a_enabled, SessionToken a_session)
 	{
 		ValidateSession(a_session);
+		if (!RecoverAfterLoad())
+			throw ToolError(500, "VR camera recovery after loading failed; retry freecam off after the scene is ready");
 		auto*      camera = RE::PlayerCamera::GetSingleton();
 		auto*      freeState = GetFreeState(camera);
 		const bool owned = IsOwned();
@@ -142,8 +172,12 @@ namespace dvb::VRFreeCamera
 			return;
 		g_loading.store(true);
 		g_session.fetch_add(1);
-		if (IsOwned())
+		if (IsOwned()) {
 			g_owner->SetState(g_previousState.get());
+			g_loadRecoveryPending = g_owner->currentState == g_freeState;
+			if (g_owner->currentState != g_previousState)
+				logs::warn("devbench: VR camera pre-load restoration failed; recovery will use the loaded scene's camera states");
+		}
 		Release();
 	}
 
@@ -153,6 +187,8 @@ namespace dvb::VRFreeCamera
 			return;
 		Release();
 		g_session.fetch_add(1);
+		if (!RecoverAfterLoad())
+			logs::warn("devbench: VR camera post-load recovery is pending; retry freecam off after the scene is ready");
 		g_loading.store(false);
 	}
 }

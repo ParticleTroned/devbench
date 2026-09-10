@@ -22,6 +22,9 @@ import requests
 from conftest import require_enum, require_tool
 
 
+VR_FREE_CAMERA_STATE_ID = 3
+
+
 pytestmark = pytest.mark.skipif(
     os.environ.get("DEVBENCH_TEST_FREECAM") != "1" or not os.environ.get("DEVBENCH_URL"),
     reason="set DEVBENCH_TEST_FREECAM=1 and DEVBENCH_URL to the intended VR instance",
@@ -82,8 +85,8 @@ class _CameraSession:
         assert status in (200, 409), (status, result)
 
 
-@pytest.fixture
-def vr_camera_session(client, tool_schema):
+def _create_camera_session(client, tool_schema):
+    """Validate the selected VR instance and scene before allowing mutations."""
     camera = require_tool(tool_schema, "camera")
     for action in ("get", "freecam", "drive"):
         require_enum(camera, "action", action)
@@ -103,11 +106,16 @@ def vr_camera_session(client, tool_schema):
     assert initial.get("freeCam") is False, initial
     assert initial.get("freeCamOwned") is False, initial
     assert type(initial.get("stateId")) is int, initial
-    assert initial["stateId"] != 3, initial
+    assert initial["stateId"] != VR_FREE_CAMERA_STATE_ID, initial
     scene = client.ok("inspect", {"kind": "scene"})
     if scene.get("playerLoaded") is not True:
         pytest.skip("load a stationary scene before running the free-camera test")
     return initial, session
+
+
+@pytest.fixture
+def vr_camera_session(client, tool_schema):
+    return _create_camera_session(client, tool_schema)
 
 
 def _after_frames(session, count=3):
@@ -189,7 +197,7 @@ def test_vr_free_camera_drive_persists_and_restores(client, vr_camera_session):
             _set_freecam(session, True)
             _set_freecam(session, True)  # Must not replace the retained return state.
             active = _after_frames(session)
-            assert active["freeCam"] is True and active["stateId"] == 3, active
+            assert active["freeCam"] is True and active["stateId"] == VR_FREE_CAMERA_STATE_ID, active
             assert active["freeCamOwned"] is True, active
 
             # Establish a known orientation before testing combined pitch/yaw;
@@ -213,7 +221,7 @@ def test_vr_free_camera_drive_persists_and_restores(client, vr_camera_session):
 
             _drive(session, target, pitch=0.15, yaw=0.25)
             driven = _after_frames(session)
-            assert driven["freeCam"] is True and driven["stateId"] == 3, driven
+            assert driven["freeCam"] is True and driven["stateId"] == VR_FREE_CAMERA_STATE_ID, driven
             assert driven["freeCamOwned"] is True, driven
             _assert_position(driven, target)
             driven_angles = _angles(driven)
