@@ -2260,7 +2260,8 @@ namespace dvb
 		camera.description =
 			"Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, "
 			"camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned } read live on the main thread, where pov is first | "
-			"third | vanity | other. action='setPov' applies a switch (param 'pov': first | third "
+			"third | vanity | other. stateId is the runtime-specific CameraState value; interpret it "
+			"with freeCamBackend. action='setPov' applies a switch (param 'pov': first | third "
 			"| vanity) on the main thread and returns { pov: <applied>, requestedPov } read back "
 			"the same tick — Skyrim's idle-vanity timer can still override it a few ticks later "
 			"while the player is stationary, so poll action='get' if you need certainty after "
@@ -2270,6 +2271,8 @@ namespace dvb
 			"the native toggle is queued; poll action='get'.freeCam before 'drive'. "
 			"action='drive' (params 'x','y','z','pitch','yaw', all default 0) "
 			"sets the free camera's world transform — requires free-cam mode already on. "
+			"VR pitch/yaw are native free-camera angles in radians; SE/AE writes them to "
+			"FreeCameraState::rotation using the existing best-effort convention. "
 			"VR enable, disable, and drive reject an active camera owned elsewhere; freeCamOwned reports devbench ownership. "
 			"VR drive completes its field writes before return; allow a rendered frame before capture. "
 			"Recordings capture the POV per sample and replay restores it via this tool, since "
@@ -2283,8 +2286,8 @@ namespace dvb
 								{ "x", json{ { "type", "number" }, { "description", "drive: world X (requires free-cam mode)" } } },
 								{ "y", json{ { "type", "number" }, { "description", "drive: world Y (requires free-cam mode)" } } },
 								{ "z", json{ { "type", "number" }, { "description", "drive: world Z (requires free-cam mode)" } } },
-								{ "pitch", json{ { "type", "number" }, { "description", "drive: native free-cam pitch in radians" } } },
-								{ "yaw", json{ { "type", "number" }, { "description", "drive: native free-cam yaw in radians" } } },
+								{ "pitch", json{ { "type", "number" }, { "description", "drive: VR native free-cam pitch in radians; SE/AE best-effort FreeCameraState::rotation.x" } } },
+								{ "yaw", json{ { "type", "number" }, { "description", "drive: VR native free-cam yaw in radians; SE/AE best-effort FreeCameraState::rotation.y" } } },
 							} },
 		};
 		a_registry.Register(std::move(camera), &CameraHandler);

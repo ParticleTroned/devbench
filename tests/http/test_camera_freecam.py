@@ -74,9 +74,12 @@ class _CameraSession:
         assert status == 200, (status, result)
         return result
 
-    def cleanup(self):
-        if self.usable:
-            _set_freecam(self, False)
+    def cleanup(self) -> None:
+        if not self.usable:
+            return
+        status, result = self.call({"action": "freecam", "on": False})
+        # Ownership or the scene may change after the last safety check.
+        assert status in (200, 409), (status, result)
 
 
 @pytest.fixture
