@@ -7,6 +7,7 @@
 #include "GameState.h"
 #include "HostApi.h"
 #include "Json.h"
+#include "KeyboardInput.h"
 #include "MainThread.h"
 #include "Papyrus.h"
 #include "Recording.h"
@@ -15,6 +16,7 @@
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 #include "VRFreeCamera.h"
+#include "VRInputState.h"
 #include "Version.h"
 
 #include <algorithm>
@@ -360,6 +362,77 @@ namespace dvb
 				return out;
 			}
 
+			if (action == "advanceTime") {
+				constexpr double kMaxAbsHours = 100000.0;  // matches the 'wait'/'sleep' tools' cap
+				const double     hours = a_args.value("hours", 0.0);
+				if (hours == 0.0)
+					throw ToolError(400, "game advanceTime: 'hours' must be non-zero");
+				if (std::fabs(hours) > kMaxAbsHours)
+					throw ToolError(400, std::format("game advanceTime: 'hours' must be within +/-{}", kMaxAbsHours));
+				return MainThread::RunAndWait([hours]() -> json {
+					auto* cal = RE::Calendar::GetSingleton();
+					if (!cal || !cal->gameHour || !cal->gameDaysPassed)
+						throw ToolError(503, "Calendar unavailable (no loaded world?)");
+
+					// gameHour and gameDaysPassed are independent engine-advanced accumulators,
+					// not derived from each other, so both are updated here to stay consistent.
+					const double     hoursPerDay = static_cast<double>(RE::Calendar::GetHoursPerDay());
+					const double     totalHours = static_cast<double>(cal->gameHour->value) + hours;
+					const auto       dayDelta = static_cast<std::int32_t>(std::floor(totalHours / hoursPerDay));
+					double           newHour = totalHours - static_cast<double>(dayDelta) * hoursPerDay;
+					constexpr double kHourEpsilon = 0.01;  // stays under the engine's own day-rollover check
+					if (newHour >= hoursPerDay - kHourEpsilon)
+						newHour = hoursPerDay - kHourEpsilon;
+					cal->gameHour->value = static_cast<float>(newHour);
+
+					if (dayDelta != 0) {
+						cal->gameDaysPassed->value += static_cast<float>(dayDelta);
+						// gameDay/gameMonth/gameYear are separate globals the engine advances on its
+						// own rollover as gameHour crosses hoursPerDay; since that crossing was
+						// absorbed above instead of left for the engine to see, walk them by hand so
+						// Calendar.GetMonth/GetYear don't go stale after a multi-day jump.
+						if (cal->gameDay && cal->gameMonth && cal->gameYear) {
+							auto day = static_cast<std::int32_t>(cal->gameDay->value);
+							auto month = static_cast<std::int32_t>(cal->gameMonth->value);  // 0-11
+							auto year = static_cast<std::int32_t>(cal->gameYear->value);
+							for (auto remaining = dayDelta; remaining > 0; --remaining) {
+								if (day < RE::Calendar::DAYS_IN_MONTH[month]) {
+									++day;
+								} else {
+									day = 1;
+									if (++month == 12) {
+										month = 0;
+										++year;
+									}
+								}
+							}
+							for (auto remaining = dayDelta; remaining < 0; ++remaining) {
+								if (day > 1) {
+									--day;
+								} else {
+									if (month-- == 0) {
+										month = 11;
+										--year;
+									}
+									day = RE::Calendar::DAYS_IN_MONTH[month];
+								}
+							}
+							cal->gameDay->value = static_cast<float>(day);
+							cal->gameMonth->value = static_cast<float>(month);
+							cal->gameYear->value = static_cast<float>(year);
+						}
+					}
+
+					return json{
+						{ "gameHour", cal->gameHour->value },
+						{ "daysPassed", cal->gameDaysPassed->value },
+						{ "day", cal->gameDay ? cal->gameDay->value : 0.0f },
+						{ "month", cal->gameMonth ? cal->gameMonth->value : 0.0f },
+						{ "year", cal->gameYear ? cal->gameYear->value : 0.0f },
+					};
+				});
+			}
+
 			auto* task = SKSE::GetTaskInterface();
 			if (!task)
 				throw ToolError(500, "SKSE TaskInterface unavailable");
@@ -412,7 +485,7 @@ namespace dvb
 					out["note"] = kLoadNote;
 				return out;
 			}
-			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast)", action));
+			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|advanceTime)", action));
 		}
 
 		bool ContainsCI(const std::string& a_hay, const std::string& a_needle);  // defined below (near CheckState)
@@ -554,6 +627,79 @@ namespace dvb
 			}
 
 			throw ToolError(400, std::format("unknown action '{}' (list|open|close|describe|accept|invoke)", action));
+		}
+
+		constexpr long long kMaxWaitHours = 100000;
+		// AdvanceSleepWaitTick() runs synchronously on the main thread once per tick, so an
+		// unbounded tick count hangs the game rather than just delaying it.
+		constexpr long long kMaxWaitTicks = 20000;
+
+		// StartWaiting/StartSleeping's synchronous autosave (bSaveOnWait/bSaveOnRest) deadlocks
+		// the VR main thread when triggered from here instead of the real Wait menu -- fixed by
+		// suppressing the pref for the call and restoring it after.
+		class ScopedAutoSaveSuppress
+		{
+		public:
+			explicit ScopedAutoSaveSuppress(const char* a_prefName)
+			{
+				if (auto* coll = RE::INIPrefSettingCollection::GetSingleton())
+					m_setting = coll->GetSetting(a_prefName);
+				if (m_setting) {
+					m_original = m_setting->GetBool();
+					m_setting->SetBool(false);
+				}
+			}
+			~ScopedAutoSaveSuppress()
+			{
+				if (m_setting)
+					m_setting->SetBool(m_original);
+			}
+			ScopedAutoSaveSuppress(const ScopedAutoSaveSuppress&) = delete;
+			ScopedAutoSaveSuppress& operator=(const ScopedAutoSaveSuppress&) = delete;
+
+		private:
+			RE::Setting* m_setting = nullptr;
+			bool         m_original = false;
+		};
+
+		json WaitOrSleepHandler(const json& a_args, bool a_sleep)
+		{
+			const auto it = a_args.find("hours");
+			if (it == a_args.end() || !it->is_number_integer())
+				throw ToolError(400, "'hours' must be a positive integer");
+			const long long hours = it->get<long long>();
+			if (hours <= 0)
+				throw ToolError(400, "'hours' must be a positive integer");
+			if (hours > kMaxWaitHours)
+				throw ToolError(400, std::format("'hours' must be <= {}", kMaxWaitHours));
+
+			return MainThread::RunAndWait([hours, a_sleep]() -> json {
+				auto* pc = RE::PlayerCharacter::GetSingleton();
+				if (!pc)
+					return json{ { "completed", false }, { "reason", "no PlayerCharacter" } };
+				if (!pc->CanSleepWait(nullptr))
+					return json{ { "completed", false }, { "reason", "blocked (see the in-game HUD message just shown)" } };
+
+				// SleepWaitMenu's own Update loop reads back its AS3 slider's displayed value each
+				// tick, so a native-only caller can't drive it to completion this way; call the
+				// tick function directly instead, bounded by how many ticks this duration needs.
+				using namespace RE::literals;
+				std::int32_t secondsPerTick = "iSecondsToSleepPerUpdate"_gs.value_or(900);
+				if (secondsPerTick <= 0)
+					secondsPerTick = 900;
+				const long long maxTicks = (hours * 3600 / secondsPerTick) + 1;
+				if (maxTicks > kMaxWaitTicks)
+					throw ToolError(400, std::format("'hours' needs {} ticks at the current {}s/tick rate (> {} limit)", maxTicks, secondsPerTick, kMaxWaitTicks));
+
+				ScopedAutoSaveSuppress noAutoSave(a_sleep ? "bSaveOnRest" : "bSaveOnWait");
+				if (a_sleep)
+					pc->StartSleeping(static_cast<std::int32_t>(hours));
+				else
+					pc->StartWaiting(static_cast<std::int32_t>(hours));
+				for (long long i = 0; i < maxTicks; ++i)
+					pc->AdvanceSleepWaitTick();
+				return json{ { "completed", true }, { "hours", hours } };
+			});
 		}
 
 		// Identify any form as { formId, formType, name, editorId } — CommonLib's RE'd accessors.
@@ -1107,9 +1253,8 @@ namespace dvb
 			// is the same ToolExtensions::Keys() data the capture-provider gate reads, surfaced
 			// here so a person can see why a gate failed without reading source. Consumers and
 			// registrations are NOT joined by plugin name — the C-ABI interface has no per-call
-			// caller identity (see ROADMAP.md's "Event source tagging" item), so guessing which
-			// consumer owns which registration would be a confident lie; both lists are returned
-			// side by side instead.
+			// caller identity, so guessing which consumer owns which registration would be a
+			// confident lie; both lists are returned side by side instead.
 			if (kind == "registrants") {
 				json consumers = json::array();
 				for (const auto& c : HostApi::Consumers())
@@ -1596,6 +1741,7 @@ namespace dvb
 			std::map<uint64_t, State> m_runs;
 		};
 
+		/// Execute a scenario step list and return its complete transcript.
 		json ScenarioHandler(const json& a_args, const ToolContext& a_ctx,
 			const ToolRegistry& a_registry, EventBus& a_events)
 		{
@@ -2052,6 +2198,8 @@ namespace dvb
 
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
+		RegisterInputTool(a_registry, a_events);
+
 		ToolDescriptor console;
 		console.name = "console";
 		console.description =
@@ -2089,16 +2237,20 @@ namespace dvb
 			"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
 			"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
 			"confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / "
-			"inspect playerLoaded for completion.";
+			"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
+			"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
+			"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
+			"read back the same tick; runs synchronously on the main thread.";
 		game.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast" }) }, { "description", "list | save | load | loadLast" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "advanceTime" }) }, { "description", "list | save | load | loadLast | advanceTime" } } },
 								{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load; from action='list')" } } },
 								{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath)" } } },
 								{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
 								{ "limit", json{ { "type", "integer" }, { "description", "list only: cap the number of saves returned (newest-first); must be > 0 if given" } } },
 								{ "detail", json{ { "type", "boolean" }, { "description", "list only: add per-save character/location/level metadata (default false)" } } },
+								{ "hours", json{ { "type", "number" }, { "description", "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)" } } },
 							} },
 		};
 		a_registry.Register(std::move(game), &GameHandler);
@@ -2268,25 +2420,39 @@ namespace dvb
 					return runScenario();
 
 				RunRegistry::Get().Start(runId);
-				std::thread([runScenario, runId]() {
-					try {
-						RunRegistry::Get().Finish(runId, runScenario());
-					} catch (const std::exception& e) {
-						RunRegistry::Get().Fail(runId, e.what());
-					}
-				}).detach();
+				try {
+					std::thread([runScenario, runId]() {
+						try {
+							RunRegistry::Get().Finish(runId, runScenario());
+						} catch (const std::exception& e) {
+							RunRegistry::Get().Fail(runId, e.what());
+						}
+					}).detach();
+				} catch (const std::exception& e) {
+					RunRegistry::Get().Fail(runId, e.what());
+					a_events.Publish("scenario.finished", json{ { "runId", runId }, { "ok", false },
+															  { "error", "could not start asynchronous scenario worker" } });
+					throw ToolError(500, std::format("could not start asynchronous scenario worker: {}", e.what()));
+				}
 				return json{ { "queued", true }, { "runId", runId }, { "steps", numSteps } };
 			});
 
 		ToolDescriptor record;
 		record.name = "record";
 		record.description =
-			"Capture a manual play-through as a replayable scenario. action='start' begins "
-			"sampling the player pose (x/y/z/angleZ/angleX + camera pos + POV + game frame) every "
-			"intervalMs (default from config recordIntervalMs, min 10) on a background thread "
-			"and captures a one-time scene manifest "
+			"Capture a manual play-through as a versioned activity trace and replayable scenario. "
+			"action='start' begins sampling the player pose (x/y/z/angleZ/angleX + camera pos + POV "
+			"+ game frame + VR HMD/left-wand/right-wand world transforms) every "
+			"intervalMs (default from config recordIntervalMs, range 10..1800000) on a background thread "
+			"while the Skyrim BSInputDeviceManager sink records every normalized keyboard, mouse, "
+			"gamepad, and VR-controller event plus menu and lifecycle transitions on the same "
+			"monotonic clock. The activity contract and exact replay support are returned by start "
+			"and stored in meta.activityCapture; activityEvents preserves unsupported events rather "
+			"than approximating them. The sampling thread also captures a one-time scene manifest "
 			"(worldspace/cell, time of day, weather, anchor pose, and the entryPoint — the save "
-			"loaded or coc'd to reach the scene, or 'unknown'); a game must be loaded. "
+			"loaded or coc'd to reach the scene, or 'unknown'). Normally a game must be loaded; "
+			"allowNoPlayer=true explicitly permits capture from the main menu/new-game flow and "
+			"stores the first subsequently loaded player scene separately. "
 			"'checkpoint' marks THIS moment (while recording is active) as a screenshot checkpoint "
 			"— requires 'id' (unique this recording); optional excludeUi (default true). Mirrors "
 			"'stop' capturing the trajectory: no manual JSON editing needed. Carries no golden/"
@@ -2294,7 +2460,7 @@ namespace dvb
 			"a golden reference doesn't exist yet at mark-time. 'stop' "
 			"writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json "
 			"and returns its path + meta (meta.checkpoints holds any marked via 'checkpoint'). "
-			"'status' reports recording/sampleCount/intervalMs/checkpointCount. "
+			"'status' reports recording/sampleCount/intervalMs/checkpointCount/activityCounts. "
 			"'replay' runs a recording file ('path'): with restoreScene=true it re-establishes "
 			"the entryPoint and waits for the player before the trajectory, so the run reproduces "
 			"the recorded scene (interiors coc the cell; exterior entries use cow with the "
@@ -2312,7 +2478,14 @@ namespace dvb
 			"replay.finished on GET /api/events (both carry runId; the runId space is shared with "
 			"scenario, so a replay's runId also resolves via scenario{action:'status'}). Pass "
 			"async:false to block the request for the run's duration and get the result object "
-			"directly. If the recording has meta.checkpoints, each expands into a `capture` step "
+			"directly. On VR, OpenVR HMD/controller poses and complete controller packet/button/touch/axis "
+			"state are sampled even before a player exists. replayInputs=true (default) starts one atomic "
+			"HMD+left+right tracked-set sequence and interleaves keyboard transitions on the same recording "
+			"clock. Legacy recording-3 files without exact controller packets are upgraded from their "
+			"wand-indexed normalized events using previous-pose hold; the replay report identifies fallback "
+			"or unsupported events. Mouse/gamepad/menu/lifecycle events remain observational and explicitly "
+			"reported rather than silently approximated. Set replayInputs=false for pose-only behavior. "
+			"If the recording has meta.checkpoints, each expands into a `capture` step "
 			"at the point in the trajectory its atMs was recorded, tagged with 'variant' for "
 			"correlation (default 'default') — see the `capture` tool. Pass "
 			"captureCheckpoints:false to replay the same recording as a plain trajectory-only run "
@@ -2328,11 +2501,14 @@ namespace dvb
 			{ "type", "object" },
 			{ "properties", json{
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "start", "stop", "status", "replay", "checkpoint" }) }, { "description", "start | stop | status | replay | checkpoint" } } },
-								{ "intervalMs", json{ { "type", "integer" }, { "description", "start: pose sample period in ms (default = config recordIntervalMs, min 10)" } } },
+								{ "intervalMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", kMaximumVRTrackedDurationMs }, { "description", "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs)" } } },
+								{ "allowNoPlayer", json{ { "type", "boolean" }, { "description", "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)" } } },
+								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata" } } },
 								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },
 								{ "excludeUi", json{ { "type", "boolean" }, { "description", "checkpoint: request a pre-UI capture source at replay (default true) — see the `capture` tool" } } },
 								{ "path", json{ { "type", "string" }, { "description", "replay: recording file to play back (from stop's 'path')" } } },
 								{ "restoreScene", json{ { "type", "boolean" }, { "description", "replay: re-establish the recorded entryPoint + wait for load before the trajectory (default false)" } } },
+								{ "replayInputs", json{ { "type", "boolean" }, { "description", "replay: run the atomic OpenVR HMD+both-controller stream and interleave keyboard transitions (default true); false replays pose/commands only" } } },
 								{ "variant", json{ { "type", "string" }, { "description", "replay: tag for any meta.checkpoints captures, for correlation (default 'default')" } } },
 								{ "captureCheckpoints", json{ { "type", "boolean" }, { "description", "replay: expand meta.checkpoints into capture steps (default true) — pass false for a plain trajectory-only replay of a checkpoint-bearing recording (no provider required, nothing captured)" } } },
 								{ "goldens", json{ { "type", "object" }, { "description", "replay: per-checkpoint SSIM comparison config, keyed by checkpoint id — {\"<id>\": {golden, threshold?, regions?}} — see the `capture` tool. Never stored in the recording itself; supply it fresh per replay so the same recording can check against different variants' goldens." } } },
@@ -2354,7 +2530,7 @@ namespace dvb
 					// Immediate 409 if a blocking menu is open at start (except restore plans — the
 					// load/coc clears menus, so those defer to the in-trajectory guard step). closeMenus
 					// clears a blocking MODAL (cancel, never affirm); a non-modal menu still errors.
-					if (!plan.value("restored", false)) {
+					if (!plan.value("restored", false) && !plan.value("allowsInitialMenus", false)) {
 						auto blocking = BlockingMenus();
 						if (!blocking.empty()) {
 							const bool allModal = std::all_of(blocking.begin(), blocking.end(),
@@ -2380,25 +2556,79 @@ namespace dvb
 					for (const auto& s : steps)
 						if (s.contains("wait"))
 							estMs += s["wait"].get<long>();
-					const uint64_t runId = RunRegistry::Get().NextId();
+					const uint64_t    runId = RunRegistry::Get().NextId();
+					const json        activity = plan.value("activity", json::object());
+					const std::string inputOwner = plan.value("inputOwner", std::string{});
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
 					logs::info("devbench: replay starting — {} steps, ~{}ms", steps.size(), estMs);
-					a_events.Publish("replay.started", json{ { "runId", runId }, { "steps", steps.size() }, { "estMs", estMs }, { "path", a_args.value("path", std::string{}) } });
+					a_events.Publish("replay.started", json{ { "runId", runId }, { "steps", steps.size() },
+														   { "estMs", estMs }, { "path", a_args.value("path", std::string{}) },
+														   { "activity", activity } });
 
 					// Captured by value: a_ctx is request-scoped and this may run on a detached
 					// thread past this handler's return; steps/coupling are already independent
 					// copies. replay.finished must publish on EVERY exit -- a poller waiting on
 					// it would otherwise hang when a step throws.
 					const json coupling = plan.value("coupling", json::object());
-					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling]() -> json {
+					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
+											   activity, inputOwner]() -> json {
+						const auto releaseRecordedInput = [&]() -> json {
+							if (inputOwner.empty())
+								return json{ { "needed", false } };
+							ToolContext inputCtx = a_ctx;
+							inputCtx.internal = true;
+							json results = json::array();
+							bool ok = true;
+							for (const char* device : { "keyboard", "vrTrackedSet" }) {
+								const ToolResult released = a_registry.Invoke("input", json{
+																						   { "action", "releaseAll" },
+																						   { "device", device },
+																						   { "owner", inputOwner },
+																					   },
+									inputCtx);
+								json             item{ { "device", device }, { "ok", released.ok } };
+								if (released.ok) {
+									item["result"] = released.value;
+									const bool semanticFailure =
+										(device == std::string_view("keyboard") &&
+											released.value.value("failed", json::array()).size() != 0) ||
+										(device == std::string_view("vrTrackedSet") &&
+											released.value.value("restorationPending", false));
+									if (semanticFailure) {
+										ok = false;
+										item["ok"] = false;
+										item["semanticFailure"] = true;
+									}
+								} else {
+									ok = false;
+									item["errorCode"] = released.errorCode;
+									item["error"] = released.errorMessage;
+								}
+								results.push_back(std::move(item));
+							}
+							return json{ { "needed", true }, { "ok", ok }, { "results", std::move(results) } };
+						};
 						json result;
 						try {
+							// Clear a same-owner lease left by an interrupted prior replay before injecting.
+							const json initialCleanup = releaseRecordedInput();
+							if (!initialCleanup.value("ok", true))
+								throw ToolError(409, "recorded input cleanup is still pending; retry after controller/key restoration succeeds");
 							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
 						} catch (const std::exception& e) {
+							const json cleanup = releaseRecordedInput();
 							a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
+							if (!cleanup.value("ok", true))
+								logs::warn("devbench: replay failed and recorded input cleanup remains pending");
 							throw;
 						}
+						result["inputCleanup"] = releaseRecordedInput();
+						if (!result["inputCleanup"].value("ok", true)) {
+							result["ok"] = false;
+							result["inputCleanupFailed"] = true;
+						}
 						result["coupling"] = coupling;  // surface effective tier / override
+						result["activity"] = activity;
 						result["checkpoints"] = SummarizeCheckpoints(result);
 						logs::info("devbench: replay finished — {} steps, ok={}",
 							result.value("stepsRun", 0), result.value("ok", false));
@@ -2410,14 +2640,22 @@ namespace dvb
 						return runReplay();
 
 					RunRegistry::Get().Start(runId);
-					std::thread([runReplay, runId]() {
-						try {
-							RunRegistry::Get().Finish(runId, runReplay());
-						} catch (const std::exception& e) {
-							RunRegistry::Get().Fail(runId, e.what());
-						}
-					}).detach();
-					return json{ { "queued", true }, { "runId", runId }, { "steps", steps.size() }, { "estMs", estMs } };
+					try {
+						std::thread([runReplay, runId]() {
+							try {
+								RunRegistry::Get().Finish(runId, runReplay());
+							} catch (const std::exception& e) {
+								RunRegistry::Get().Fail(runId, e.what());
+							}
+						}).detach();
+					} catch (const std::exception& e) {
+						RunRegistry::Get().Fail(runId, e.what());
+						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false },
+																{ "error", "could not start asynchronous replay worker" } });
+						throw ToolError(500, std::format("could not start asynchronous replay worker: {}", e.what()));
+					}
+					return json{ { "queued", true }, { "runId", runId }, { "steps", steps.size() },
+						{ "estMs", estMs }, { "activity", activity } };
 				}
 				if (action == "status" && a_args.contains("runId")) {
 					const uint64_t runId = ParseRunId(a_args);
@@ -2450,5 +2688,56 @@ namespace dvb
 			[](const json& a_args, const ToolContext&) {
 				return Recording::ManageRecordings(a_args);
 			});
+
+		ToolDescriptor wait;
+		wait.name = "wait";
+		wait.description =
+			"Advance time by waiting `hours`, synchronously and without touching the Wait "
+			"menu's UI at all: starts the wait, then drives its completion (autosave, script "
+			"events) to done before returning — no polling needed. Refuses with "
+			"{ completed:false, reason } on the same gate the menu itself enforces (combat, "
+			"trespassing, midair, hostiles nearby, etc.).";
+		wait.inputSchema = json{
+			{ "type", "object" },
+			{ "properties", json{
+								{ "hours", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", kMaxWaitHours }, { "description", "hours to wait (> 0)" } } },
+							} },
+			{ "required", json::array({ "hours" }) },
+		};
+		a_registry.Register(std::move(wait), [](const json& a_args, const ToolContext&) {
+			return WaitOrSleepHandler(a_args, false);
+		});
+
+		ToolDescriptor sleep;
+		sleep.name = "sleep";
+		sleep.description =
+			"Advance time by sleeping `hours` (the rest variant — drives the well-rested / "
+			"lover's-comfort bonus). Same mechanics as `wait`: synchronous, no menu UI, "
+			"refuses with { completed:false, reason } on the same gate the menu enforces.";
+		sleep.inputSchema = json{
+			{ "type", "object" },
+			{ "properties", json{
+								{ "hours", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", kMaxWaitHours }, { "description", "hours to sleep (> 0)" } } },
+							} },
+			{ "required", json::array({ "hours" }) },
+		};
+		a_registry.Register(std::move(sleep), [](const json& a_args, const ToolContext&) {
+			return WaitOrSleepHandler(a_args, true);
+		});
+
+		// A registered tool, not just a REST field, so a client on this DLL's own /mcp
+		// endpoint (no REST envelope to carry a sibling field) sees it too.
+		ToolDescriptor bridgeSetup;
+		bridgeSetup.name = "mcp_bridge_setup";
+		bridgeSetup.description =
+			"Read this to connect via devbench-bridge — a companion MCP proxy that survives this "
+			"game process restarting (a direct connection to this tool's own /mcp endpoint does "
+			"not). Returns { exePath, args, mcpJsonSnippet, installCommand }: paste mcpJsonSnippet "
+			"into your MCP client's config, or run installCommand to print the same thing. Never "
+			"edits your client config itself.";
+		bridgeSetup.readOnly = true;
+		a_registry.Register(std::move(bridgeSetup), [](const json&, const ToolContext&) {
+			return BridgeDiscoveryInfo();
+		});
 	}
 }

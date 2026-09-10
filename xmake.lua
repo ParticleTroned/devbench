@@ -15,22 +15,8 @@ includes("xmake/cpp-mcp.lua")
 set_project("devbench")
 set_license("GPL-3.0")
 
-option("build_label")
-set_default("")
-set_showmenu(true)
-set_description("Metadata appended to the reported runtime version for local builds")
-option_end()
-
-local version = "1.15.2"
+local version = "1.18.1"
 local ver = version:split("%.")
-local build_label = get_config("build_label")
-local version_string = version
-if build_label and build_label ~= "" then
-    if not build_label:match("^[%w.%-]+$") then
-        raise("DEVBENCH_BUILD_LABEL must contain only letters, digits, dots, and hyphens")
-    end
-    version_string = version .. "+" .. build_label
-end
 set_version(version)
 
 -- defaults
@@ -44,6 +30,13 @@ set_policy("package.requires_lock", true)
 add_rules("mode.debug", "mode.releasedbg")
 set_defaultmode("releasedbg")
 add_rules("plugin.vsxmake.autoupdate")
+
+-- Fork metadata is independent from the upstream numeric version.
+option("build_label")
+set_default("")
+set_showmenu(true)
+set_description("Metadata appended to the reported runtime version for local builds")
+option_end()
 
 -- packages
 add_requires("nlohmann_json")
@@ -73,6 +66,9 @@ add_deps("commonlibsse-ng")
 add_packages("skse-menu-framework-api", "nlohmann_json")
 add_defines("_SILENCE_CXX17_CODECVT_HEADER_DEPRECATION_WARNING") -- SMF header uses std::wstring_convert
 add_defines("UNICODE", "_UNICODE", "_WINSOCKAPI_")
+-- MSVC's default execution charset is the system codepage, not UTF-8; without this,
+-- non-ASCII bytes in string literals (e.g. em dashes in UI tooltip text) get mangled.
+add_cxflags("/utf-8", { force = true })
 add_files("src/RecordingsMenu.cpp")
 add_includedirs("src")
 target_end()
@@ -85,6 +81,7 @@ set_warnings("all")
 add_deps("commonlibsse-ng")
 add_packages("fuck-api", "imgui", "simpleini", "nlohmann_json")
 add_defines("UNICODE", "_UNICODE", "_WINSOCKAPI_")
+add_cxflags("/utf-8", { force = true }) -- see devbench-UI's identical flag for why
 add_files("src/RecordingsMenuFuck.cpp")
 add_includedirs("src")
 target_end()
@@ -101,6 +98,10 @@ set_basename("devbench")
 -- that <Windows.h> would otherwise include via CommonLib.
 add_defines("_WINSOCKAPI_")
 
+-- see devbench-UI's identical flag for why (this target's own sources carry the same
+-- non-ASCII string literals, e.g. Server.cpp's log lines and mcp_bridge_setup's note).
+add_cxflags("/utf-8", { force = true })
+
 -- generate PDB (releasedbg handles /Zi; /DEBUG tells the linker to emit it)
 add_shflags("/DEBUG", { force = true })
 
@@ -108,7 +109,25 @@ add_shflags("/DEBUG", { force = true })
 set_configvar("VERSION_MAJOR", tonumber(ver[1]))
 set_configvar("VERSION_MINOR", tonumber(ver[2]))
 set_configvar("VERSION_PATCH", tonumber(ver[3]))
-set_configvar("VERSION_STRING", version_string)
+set_configvar("VERSION_STRING", version)
+-- Reevaluate metadata on ordinary incremental builds after FORK_VERSION changes.
+set_policy("build.always_update_configfiles", true)
+on_load(function(target)
+    import("core.project.config")
+    local fork_version = io.readfile(path.join(os.projectdir(), "FORK_VERSION")):trim()
+    if not fork_version:match("^%d+%.%d+%.%d+$") then
+        raise("FORK_VERSION must contain a major.minor.patch version")
+    end
+    local version_string = target:version() .. "+pt." .. fork_version
+    local build_label = config.get("build_label")
+    if build_label and build_label ~= "" then
+        if not build_label:match("^[%w.%-]+$") then
+            raise("build_label must contain only letters, digits, dots, and hyphens")
+        end
+        version_string = version_string .. "." .. build_label
+    end
+    target:set("configvar", "VERSION_STRING", version_string)
+end)
 
 -- commonlibsse-ng plugin (auto-generates the SKSE plugin declaration)
 add_rules("commonlibsse-ng.plugin", {
@@ -172,6 +191,9 @@ add_includedirs("src")
 add_files("tests/*.cpp")
 add_files("src/ToolRegistry.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/Ssim.cpp") -- exercised directly; pure logic, no game deps
+add_files("src/KeyboardInputState.cpp") -- key resolution + lease ownership; pure logic
+add_files("src/VRInputState.cpp") -- atomic tracked-set validation/encoding; pure logic
+add_files("src/RecordingActivity.cpp") -- activity contract + input/trajectory interleave; pure logic
 add_headerfiles("tests/*.h")
 set_pcxxheader("tests/pch.h")
 add_defines("_WINSOCKAPI_")

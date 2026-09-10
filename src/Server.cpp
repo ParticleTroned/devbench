@@ -56,15 +56,47 @@ namespace
 		return available;
 	}
 
+	// %LOCALAPPDATA% survives a VFS mod manager's Data virtualization (MO2's overwrite folder
+	// swallows writes to Data/SKSE/Plugins/devbench); per-game subfolder since SE and VR run
+	// concurrently on separate ports.
+	std::optional<std::filesystem::path> ExternalStateDir()
+	{
+		wchar_t    buf[MAX_PATH]{};
+		const auto n = ::GetEnvironmentVariableW(L"LOCALAPPDATA", buf, static_cast<DWORD>(std::size(buf)));
+		if (n == 0 || n >= std::size(buf))
+			return std::nullopt;
+		return std::filesystem::path(buf) / "devbench" / (REL::Module::IsVR() ? "vr" : "se");
+	}
+
 	// Publish the actually-bound port so fixed-URL clients can discover a non-default
 	// choice (when auto-iteration moved off the configured port).
 	void WriteRuntimeInfo(int a_port)
 	{
-		std::error_code ec;
+		const std::string payload = "{\"port\":" + std::to_string(a_port) + "}\n";
+		std::error_code   ec;
 		std::filesystem::create_directories("Data/SKSE/Plugins/devbench", ec);
-		std::ofstream f("Data/SKSE/Plugins/devbench/runtime.json", std::ios::trunc);
-		if (f)
-			f << "{\"port\":" << a_port << "}\n";
+		if (std::ofstream f("Data/SKSE/Plugins/devbench/runtime.json", std::ios::trunc); f)
+			f << payload;
+		if (auto dir = ExternalStateDir()) {
+			std::filesystem::create_directories(*dir, ec);
+			if (std::ofstream f(*dir / "runtime.json", std::ios::trunc); f)
+				f << payload;
+		}
+	}
+
+	// Mirror of GET /api/tools's mcp_bridge block onto disk, for a caller who found devbench
+	// via its files rather than a live REST call (e.g. reading the install directory directly).
+	void WriteBridgeInfo()
+	{
+		const std::string payload = dvb::BridgeDiscoveryInfo().dump(2) + "\n";
+		if (std::ofstream f("Data/SKSE/Plugins/devbench/mcp-bridge.json", std::ios::trunc); f)
+			f << payload;
+		if (auto dir = ExternalStateDir()) {
+			std::error_code ec;
+			std::filesystem::create_directories(*dir, ec);
+			if (std::ofstream f(*dir / "mcp-bridge.json", std::ios::trunc); f)
+				f << payload;
+		}
 	}
 }
 
@@ -135,6 +167,7 @@ namespace dvb
 		const bool ok = m_mcp->start(false);  // non-blocking; spawns the listener thread
 		if (ok) {
 			WriteRuntimeInfo(chosen);
+			WriteBridgeInfo();
 			if (chosen != m_port)
 				logs::info("devbench: configured port {} busy → bound {}", m_port, chosen);
 		} else {
@@ -248,5 +281,31 @@ namespace dvb
 		static const std::string exe = ExecutableName();
 		static const bool        vr = REL::Module::IsVR();
 		return json{ { "pid", pid }, { "port", BoundPort() }, { "exe", exe }, { "vr", vr } };
+	}
+
+	json BridgeDiscoveryInfo()
+	{
+		const bool        vr = REL::Module::IsVR();
+		const std::string game = vr ? "vr" : "se";
+		std::error_code   ec;
+		const std::string exePath = std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec).string();
+		const std::string name = "devbench-" + game;
+		json              result{
+			{ "exePath", exePath },
+			{ "args", json::array({ "--game", game }) },
+			{ "mcpJsonSnippet",
+				json{ { "mcpServers", json{ { name, json{ { "command", exePath }, { "args", json::array({ "--game", game }) } } } } } } },
+			{ "installCommand", std::format("\"{}\" setup --game {}", exePath, game) },
+			{ "note",
+				"Add mcpJsonSnippet to your MCP client's config (e.g. .mcp.json), or run installCommand "
+				"to print the same thing — devbench never edits your client config itself. Under a VFS mod "
+				"manager (MO2, …), exePath is only reachable by processes launched through that manager's "
+				"virtual filesystem -- an MCP client spawning the bridge directly needs a real, on-disk copy "
+				"instead (extract devbench-bridge.exe from the release archive). runtime.json and this file "
+				"are also mirrored to externalStateDir, which isn't virtualized, for exactly that reason." },
+		};
+		if (auto dir = ExternalStateDir())
+			result["externalStateDir"] = dir->string();
+		return result;
 	}
 }

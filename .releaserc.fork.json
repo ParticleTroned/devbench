@@ -1,0 +1,44 @@
+{
+  "branches": ["main"],
+  "plugins": [
+    "@semantic-release/commit-analyzer",
+    [
+      "@google/semantic-release-replace-plugin",
+      {
+        "replacements": [
+          {
+            "files": ["FORK_VERSION"],
+            "from": "^\\d+\\.\\d+\\.\\d+\\s*$",
+            "to": "${nextRelease.version}\n",
+            "results": [
+              {
+                "file": "FORK_VERSION",
+                "hasChanged": true,
+                "numMatches": 1,
+                "numReplacements": 1
+              }
+            ],
+            "countMatches": true
+          }
+        ]
+      }
+    ],
+    "./scripts/fork-release-notes.cjs",
+    "@semantic-release/release-notes-generator",
+    [
+      "@semantic-release/github",
+      {
+        "draftRelease": true
+      }
+    ],
+    [
+      "@semantic-release/git",
+      {
+        "assets": ["FORK_VERSION"],
+        "message": "chore(release): pt-v${nextRelease.version} [skip ci]\n\n${nextRelease.notes}"
+      }
+    ]
+  ],
+  "repositoryUrl": "https://github.com/ParticleTroned/devbench.git",
+  "tagFormat": "pt-v${version}"
+}
