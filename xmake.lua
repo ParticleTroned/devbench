@@ -110,15 +110,13 @@ set_configvar("VERSION_MAJOR", tonumber(ver[1]))
 set_configvar("VERSION_MINOR", tonumber(ver[2]))
 set_configvar("VERSION_PATCH", tonumber(ver[3]))
 set_configvar("VERSION_STRING", version)
--- Reevaluate metadata on ordinary incremental builds after FORK_VERSION changes.
+-- Reevaluate metadata when the checkout advances to a new release tag.
 set_policy("build.always_update_configfiles", true)
 on_load(function(target)
     import("core.project.config")
-    local fork_version = io.readfile(path.join(os.projectdir(), "FORK_VERSION")):trim()
-    if not fork_version:match("^%d+%.%d+%.%d+$") then
-        raise("FORK_VERSION must contain a major.minor.patch version")
-    end
-    local version_string = target:version() .. "+pt." .. fork_version
+    import("fork_version", { rootdir = path.join(os.projectdir(), "scripts") })
+    local fork_version, development_suffix = fork_version(os.projectdir())
+    local version_string = target:version() .. "+pt." .. fork_version .. development_suffix
     local build_label = config.get("build_label")
     if build_label and build_label ~= "" then
         if not build_label:match("^[%w.%-]+$") then

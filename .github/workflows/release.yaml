@@ -5,11 +5,12 @@
 # GitHub Release whose body is the curated changelog. Downstream jobs then build the
 # plugin and the bridge exe, attach the .7z mod archive to that release, and — on the
 # source repo — upload to Nexus with the same changelog.
-# The maintained fork uses pt-vX.Y.Z tags and bumps only FORK_VERSION.
+# The maintained fork uses pt-vX.Y.Z tags without release commits; the tagged
+# build derives its runtime version from Git.
 #
 # Debounce: a leading `debounce` job waits out a short quiet window; each new push cancels the
 # still-sleeping wait and restarts it, so a burst of merges collapses into ONE release instead of
-# one per push. workflow_dispatch skips the wait; the [skip ci] bump commit triggers neither.
+# one per push. workflow_dispatch skips the wait; upstream's [skip ci] bump triggers neither.
 # Concurrency is per-job (a top-level group can't hold both semantics): `debounce` is
 # cancel-in-progress (only ever a sleeping wait); `semantic-release` and `nexus` are
 # cancel-in-progress:false so a live publish/upload is never aborted, and the `nexus` group also
@@ -64,13 +65,13 @@ jobs:
     if: >-
       github.repository == 'alandtse/devbench' ||
       github.repository == 'ParticleTroned/devbench'
-    # Own group, cancel-in-progress: false — a live bump commit + tag + Release is never aborted
+    # Own group, cancel-in-progress: false — a live tag + Release is never aborted
     # by a newer push; concurrent runs queue behind it.
     concurrency:
       group: semantic-release-publish
       cancel-in-progress: false
     permissions:
-      contents: write # push the bump commit + tag, create the GitHub Release
+      contents: write # upstream bumps its version; both repositories tag and publish
     outputs:
       new_release_published: ${{ steps.semantic.outputs.new_release_published }}
       new_release_version: ${{ steps.semantic.outputs.new_release_version }}
@@ -90,8 +91,8 @@ jobs:
         with:
           node-version: 24
 
-      # Select the fork config only inside this disposable checkout. Its release
-      # commit stages FORK_VERSION only; upstream's tracked .releaserc stays intact.
+      # Select the fork config only inside this disposable checkout. The fork
+      # tags main without a release commit; upstream's .releaserc stays intact.
       - name: Select fork release configuration
         if: github.repository == 'ParticleTroned/devbench'
         run: cp .releaserc.fork.json .releaserc
@@ -103,7 +104,7 @@ jobs:
           # Pin for reproducible releases (matches the sibling repos).
           semantic_version: 24.2.6
           # commit-analyzer, release-notes-generator, and github ship with the
-          # action; these two do not, so they're installed on the fly.
+          # action; upstream's version bump needs these two extra plugins.
           extra_plugins: |
             @semantic-release/git
             @google/semantic-release-replace-plugin

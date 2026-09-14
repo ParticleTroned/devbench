@@ -1,5 +1,11 @@
 const assert = require("node:assert/strict");
-const { mkdtempSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
+const {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} = require("node:fs");
 const { tmpdir } = require("node:os");
 const { basename, dirname, join, resolve } = require("node:path");
 const test = require("node:test");
@@ -71,7 +77,7 @@ test("release notes reject missing, malformed, or ambiguous upstream versions", 
   }
 });
 
-test("fork and upstream releases use separate repositories, tags, and committed assets", () => {
+test("fork releases tag source commits without version commits", () => {
   const upstream = JSON.parse(
     readFileSync(join(repositoryRoot, ".releaserc"), "utf8"),
   );
@@ -88,60 +94,32 @@ test("fork and upstream releases use separate repositories, tags, and committed 
   assert.deepEqual(pluginOptions(upstream, "@semantic-release/git").assets, [
     "xmake.lua",
   ]);
-  assert.deepEqual(pluginOptions(fork, "@semantic-release/git").assets, [
-    "FORK_VERSION",
-  ]);
-  assert.ok(
-    pluginOptions(fork, "@semantic-release/git").message.includes(
-      "pt-v${nextRelease.version}",
-    ),
+  const forkPlugins = fork.plugins.map((plugin) =>
+    Array.isArray(plugin) ? plugin[0] : plugin,
   );
+  assert.ok(!forkPlugins.includes("@semantic-release/git"));
+  assert.ok(!forkPlugins.includes("@google/semantic-release-replace-plugin"));
+  assert.equal(existsSync(join(repositoryRoot, "FORK_VERSION")), false);
 
   const upstreamFiles = pluginOptions(
     upstream,
     "@google/semantic-release-replace-plugin",
   ).replacements.flatMap((replacement) => replacement.files);
-  const forkFiles = pluginOptions(
-    fork,
-    "@google/semantic-release-replace-plugin",
-  ).replacements.flatMap((replacement) => replacement.files);
   assert.deepEqual(upstreamFiles, ["xmake.lua"]);
-  assert.deepEqual(forkFiles, ["FORK_VERSION"]);
 });
 
-test("fork release replacement updates only fork metadata in a checkout", (t) => {
-  const source = 'local version = "1.18.1"\nset_version(version)\n';
-  const cwd = fixture(t, source);
-  const upstreamConfig = readFileSync(
-    join(repositoryRoot, ".releaserc"),
+test("release builds fetch tags and use the new tag as their ref", () => {
+  const releaseWorkflow = readFileSync(
+    join(repositoryRoot, ".github/workflows/release.yaml"),
     "utf8",
   );
-  writeFileSync(join(cwd, ".releaserc"), upstreamConfig);
-  writeFileSync(join(cwd, "FORK_VERSION"), "1.15.2\r\n");
-  const fork = JSON.parse(
-    readFileSync(join(repositoryRoot, ".releaserc.fork.json"), "utf8"),
+  const buildWorkflow = readFileSync(
+    join(repositoryRoot, ".github/workflows/_build.yaml"),
+    "utf8",
   );
-  const replacements = pluginOptions(
-    fork,
-    "@google/semantic-release-replace-plugin",
-  ).replacements;
-
-  for (const replacement of replacements) {
-    for (const file of [replacement.files].flat()) {
-      assert.equal(file, "FORK_VERSION");
-      const target = join(cwd, file);
-      const before = readFileSync(target, "utf8");
-      const pattern = new RegExp(replacement.from, "g");
-      assert.equal([...before.matchAll(pattern)].length, 1);
-      const after = before.replace(
-        pattern,
-        replacement.to.replaceAll("${nextRelease.version}", "1.16.0"),
-      );
-      writeFileSync(target, after);
-    }
-  }
-
-  assert.equal(readFileSync(join(cwd, "FORK_VERSION"), "utf8"), "1.16.0\n");
-  assert.equal(readFileSync(join(cwd, "xmake.lua"), "utf8"), source);
-  assert.equal(readFileSync(join(cwd, ".releaserc"), "utf8"), upstreamConfig);
+  assert.match(
+    releaseWorkflow,
+    /ref: \${{ needs\.semantic-release\.outputs\.new_release_git_tag }}/,
+  );
+  assert.match(buildWorkflow, /fetch-depth: 0/);
 });

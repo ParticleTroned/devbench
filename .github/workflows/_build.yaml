@@ -35,12 +35,17 @@ jobs:
         uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
+          # Xmake derives the fork version from the nearest reachable pt-v tag.
+          fetch-depth: 0
           submodules: recursive
 
       - name: Set up xmake
         uses: xmake-io/github-action-setup-xmake@v1
         with:
           xmake-version: latest
+
+      - name: Check fork version identity
+        run: xmake lua tests/fork-version.lua
 
       # CommonLibSSE-NG itself is compiled in-tree (not a cached package), but its
       # xmake-resolved deps (fmt, spdlog, …) and nlohmann_json are — cache them keyed

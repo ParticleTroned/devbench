@@ -102,27 +102,34 @@ xmake
 # auto-deploy: set SkyrimPluginTargets to ';'-separated game Data dirs before building
 ```
 
-The maintained fork reports both versions, for example `1.18.1+pt.1.16.0`:
-`1.18.1` is the upstream base, while `1.16.0` identifies the fork release.
-`--build_label=a790ec5` appends `.a790ec5` for local build identification.
-The numeric SKSE/API version continues to match upstream.
+The maintained fork reports both versions, for example `1.18.1+pt.1.16.1`:
+`1.18.1` is the upstream base, while `1.16.1` comes from the reachable
+`pt-v1.16.1` Git tag. Untagged commits report a `.dev.<distance>.<sha>` suffix;
+`--build_label=a790ec5` adds a further local build identifier. Clone with
+tags, or run `git fetch --tags` before building. Builds without a reachable
+fork release tag fail rather than reporting an invented release version.
+The combined string is compiled into `devbench.dll` and reported by the startup
+log, MCP server metadata, and state response. The numeric SKSE/API version
+continues to match upstream for compatibility; it does not encode the fork
+release. Windows file properties do not currently expose the combined string.
 
 ### Fork releases and upstream synchronization
 
 Upstream owns `local version` in `xmake.lua` and its `vX.Y.Z` tags. The fork owns
-`FORK_VERSION` and a separate `pt-vX.Y.Z` tag sequence. Fork releases use
-`.releaserc.fork.json`, update only `FORK_VERSION`, and state the upstream base in
-their release notes. The tracked upstream `.releaserc` is preserved; the fork's
-release job selects its own configuration only in the disposable CI checkout.
+a separate `pt-vX.Y.Z` tag sequence. Fork releases use `.releaserc.fork.json`
+to tag the merged commit and publish its binaries without pushing a version
+commit to `main`. The tagged build embeds that tag's fork version and release
+notes state the upstream base. The tracked upstream `.releaserc` is preserved;
+the fork selects its configuration only in the disposable CI checkout.
 
 The existing fork release `v1.15.2` is also identified by `pt-v1.15.2` at the same
 commit, preserving the fork's version history without changing legacy tags.
 Upstream `v*` tags do not participate in the new fork release sequence.
 
 When synchronizing, fetch upstream and merge `upstream/main` into the fork's
-`main`; retain upstream's numeric version and the fork's independent
-`FORK_VERSION`. Keep both histories rather than resetting to upstream. Newly
-merged feature and fix commits contribute to the next semantic fork release.
+`main`; retain upstream's numeric version and the fork's independent release
+tags. Keep both histories rather than resetting to upstream. Newly merged
+feature and fix commits contribute to the next semantic fork release.
 Publish only to `origin` (`ParticleTroned/devbench`); `upstream` is fetch-only.
 Nexus publishing remains limited to the upstream repository.
 
