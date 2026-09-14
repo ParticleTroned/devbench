@@ -20,13 +20,17 @@ function main(repository)
                 "describe",
                 "--tags",
                 "--long",
+                "--first-parent",
                 "--match=pt-v[0-9]*",
                 "HEAD",
             })
         end,
         catch({
-            function()
-                raise("Cannot derive fork version from Git; fetch reachable pt-vX.Y.Z tags before building")
+            function(errors)
+                raise(
+                    "Cannot derive fork version from Git; fetch reachable pt-vX.Y.Z tags before building: "
+                        .. tostring(errors)
+                )
             end,
         }),
     })

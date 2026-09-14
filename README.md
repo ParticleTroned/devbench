@@ -104,10 +104,12 @@ xmake
 
 The maintained fork reports both versions, for example `1.18.1+pt.1.16.1`:
 `1.18.1` is the upstream base, while `1.16.1` comes from the reachable
-`pt-v1.16.1` Git tag. Untagged commits report a `.dev.<distance>.<sha>` suffix;
-`--build_label=a790ec5` adds a further local build identifier. Clone with
-tags, or run `git fetch --tags` before building. Builds without a reachable
-fork release tag fail rather than reporting an invented release version.
+`pt-v1.16.1` Git tag on the first-parent history. Untagged commits report a
+`.dev.<distance>.<sha>` suffix; `--build_label=a790ec5` adds a further local
+build identifier. Clone with tags, run `git fetch --tags` in a full clone,
+or run `git fetch --unshallow --tags` in a shallow clone. Builds without a
+reachable fork release tag fail rather than reporting an invented release
+version.
 The combined string is compiled into `devbench.dll` and reported by the startup
 log, MCP server metadata, and state response. The numeric SKSE/API version
 continues to match upstream for compatibility; it does not encode the fork
