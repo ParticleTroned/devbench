@@ -21,19 +21,26 @@ namespace dvb::Recording
 		ParseBoundedIntegerArgument(meta, "recordedMs", 0, 0, kMaximumVRTrackedDurationMs);
 		ParseBoundedIntegerArgument(meta, "lastSampleMs", 0, 0, kMaximumVRTrackedDurationMs);
 
-		const auto validateStream = [](const json& parent, const char* stream, const char* timestamp) {
+		const auto validateStream = [](const json& parent, const char* stream, const char* timestamp,
+										bool includeWaits = false) {
 			if (!parent.contains(stream))
 				return;
 			const auto& rows = parent.at(stream);
 			if (!rows.is_array())
 				throw std::invalid_argument(std::format("recording {} must be an array", stream));
+			std::int64_t clockMs = 0;
 			for (const auto& row : rows) {
 				if (!row.is_object())
 					throw std::invalid_argument(std::format("recording {} entries must be objects", stream));
-				ParseBoundedIntegerArgument(row, timestamp, 0, 0, kMaximumVRTrackedDurationMs);
+				const auto atMs = ParseBoundedIntegerArgument(row, timestamp, 0, 0, kMaximumVRTrackedDurationMs);
+				if (includeWaits) {
+					// Absolute offsets advance replay before waits consume the remaining budget.
+					clockMs = std::max(clockMs, atMs);
+					clockMs += ParseBoundedIntegerArgument(row, "wait", 0, 0, kMaximumVRTrackedDurationMs - clockMs);
+				}
 			}
 		};
-		validateStream(a_recording, "steps", "atMs");
+		validateStream(a_recording, "steps", "atMs", true);
 		validateStream(a_recording, "activityEvents", "tMs");
 		validateStream(a_recording, "trackingSamples", "tMs");
 		validateStream(meta, "checkpoints", "atMs");

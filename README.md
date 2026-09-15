@@ -245,7 +245,9 @@ observations to leave room within the retained 60,000-sample budgets. Sampling
 does not skip normalized input events. For a replayable trace, pass
 `maximumDurationMs=1800000` and choose a suitable interval. A recording exceeding
 30 minutes remains valid observation evidence, but replay rejects it before
-input or scene mutation. Check `remainingDurationMs`,
+input or scene mutation. Replay also requires nonnegative integer step waits
+and checks the combined `atMs`/`wait` timeline against that same limit.
+Check `remainingDurationMs`,
 `remainingTrackingActivityFrames` and `remainingPoseSamples` during long tests.
 These are bounded recordings, not automatic file rotation or unlimited capture.
 

@@ -13,7 +13,7 @@ namespace dvb::Recording
 	json ActivityCaptureContract();
 	json SummarizeActivity(const json& a_events);
 
-	/// Reject invalid or overlong recording timestamps before planning any replay.
+	/// Reject invalid timestamps, waits, or an overlong combined replay clock.
 	/// Missing legacy metadata is allowed; retained stream timestamps are still checked.
 	void ValidateRecordingReplayDuration(const json& a_recording);
 

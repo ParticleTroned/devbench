@@ -46,6 +46,49 @@ TEST_CASE("overlong observation streams cannot bypass replay by omitting duratio
 		std::invalid_argument);
 }
 
+TEST_CASE("replay rejects invalid and overlong waits before planning")
+{
+	for (const json& wait : json::array({ -1, 1800001, 0.5, "100", nullptr, true,
+			 std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::uint64_t>::max() })) {
+		const json recording{ { "steps", json::array({ json{ { "wait", wait } } }) } };
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+	}
+}
+
+TEST_CASE("replay combines cumulative waits with forward and backward offsets")
+{
+	const json timelines = json::array({
+		json::array({ json{ { "wait", 900000 } }, json{ { "wait", 900001 } } }),
+		json::array({ json{ { "atMs", 1500000 }, { "wait", 300001 } } }),
+		json::array({ json{ { "wait", 1700000 } }, json{ { "atMs", 10 }, { "wait", 100001 } } }),
+	});
+	for (const auto& steps : timelines) {
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{ { "steps", steps } }), std::invalid_argument);
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{
+							{ "meta", { { "recordedMs", 1 } } }, { "steps", steps } }),
+			std::invalid_argument);
+	}
+}
+
+TEST_CASE("replay clock accepts the exact limit and agrees with activity planning")
+{
+	json recording{ { "steps", json::array({
+								   json{ { "wait", 0 } },
+								   json{ { "atMs", 100 }, { "wait", 10 } },
+								   json{ { "atMs", 50 }, { "wait", 20 } },
+								   json{ { "wait", 1799870 } },
+								   json{ { "atMs", 1800000 } },
+							   }) } };
+	ValidateRecordingReplayDuration(recording);
+	const auto   plan = InterleaveReplayableActivity(recording["steps"], json::array(), "recording:clock", true);
+	std::int64_t durationMs = 0;
+	for (const auto& step : plan["steps"])
+		durationMs += step.value("wait", std::int64_t{ 0 });
+	CHECK(durationMs == dvb::kMaximumVRTrackedDurationMs);
+	recording["steps"].push_back(json{ { "wait", 1 } });
+	CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+}
+
 namespace
 {
 	json Button(std::int64_t a_ms, std::uint64_t a_seq, const char* a_device,
