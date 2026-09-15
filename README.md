@@ -247,6 +247,8 @@ does not skip normalized input events. For a replayable trace, pass
 30 minutes remains valid observation evidence, but replay rejects it before
 input or scene mutation. Replay also requires nonnegative integer step waits
 and checks the combined `atMs`/`wait` timeline against that same limit.
+With VR input replay enabled, the generated controller frames and their 50 ms
+tail must also fit within 30 minutes; leave room for that tail when recording.
 Check `remainingDurationMs`,
 `remainingTrackingActivityFrames` and `remainingPoseSamples` during long tests.
 These are bounded recordings, not automatic file rotation or unlimited capture.

@@ -368,6 +368,8 @@ namespace dvb::Recording
 		}
 		const auto durationMs = frames.empty() ? 0 :
 		                                         frames.back().value("tMs", std::int64_t{ 0 }) + kReplayTailMs;
+		if (durationMs > kMaximumVRTrackedDurationMs)
+			throw std::invalid_argument("VR replay duration including its tail exceeds the replay duration limit");
 		report["emittedFrames"] = frames.size();
 		report["convertedControllerEvents"] = converted;
 		report["unsupportedControllerEvents"] = unsupported;

@@ -91,6 +91,19 @@ TEST_CASE("replay clock accepts the exact limit and agrees with activity plannin
 
 namespace
 {
+	json TrackingSample(std::int64_t a_ms)
+	{
+		const auto pose = [](int index) {
+			return json{ { "available", true }, { "connected", true }, { "valid", true },
+				{ "index", index }, { "trackingResult", 200 },
+				{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
+				{ "velocity", json::array({ 0, 0, 0 }) },
+				{ "angularVelocity", json::array({ 0, 0, 0 }) } };
+		};
+		return json{ { "tMs", a_ms }, { "originCode", 1 }, { "hmd", pose(0) },
+			{ "left", pose(1) }, { "right", pose(2) } };
+	}
+
 	json Button(std::int64_t a_ms, std::uint64_t a_seq, const char* a_device,
 		const char* a_state, int a_id)
 	{
@@ -129,18 +142,9 @@ TEST_CASE("activity summary separates replayable keyboard transitions from prese
 
 TEST_CASE("legacy controller events become atomic tracked-set frames without losing short presses")
 {
-	const auto pose = [](int index) {
-		return json{ { "available", true }, { "connected", true }, { "valid", true },
-			{ "index", index }, { "trackingResult", 200 },
-			{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
-			{ "velocity", json::array({ 0, 0, 0 }) },
-			{ "angularVelocity", json::array({ 0, 0, 0 }) } };
-	};
 	const json samples = json::array({
-		json{ { "tMs", 20 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
-		json{ { "tMs", 100 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
+		TrackingSample(20),
+		TrackingSample(100),
 	});
 	json       down = Button(40, 1, "oculusPrimary", "down", 33);
 	down["wandIndex"] = 2;
@@ -190,6 +194,61 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 		std::invalid_argument);
 }
 
+TEST_CASE("VR replay duration includes the full tail at the boundary")
+{
+	const auto limitMs = dvb::kMaximumVRTrackedDurationMs;
+	const auto plan = BuildVRTrackedSetReplay(json::array({ TrackingSample(limitMs - 50) }),
+		json::array(), "recording:test", true);
+	CHECK(plan["durationMs"] == limitMs);
+	CHECK(plan["report"]["durationMs"] == limitMs);
+	CHECK(plan["step"]["args"]["tailMs"] == 50);
+
+	for (const auto tMs : { limitMs - 49, limitMs }) {
+		CHECK_THROWS_AS(BuildVRTrackedSetReplay(json::array({ TrackingSample(tMs) }),
+							json::array(), "recording:test", true),
+			std::invalid_argument);
+	}
+}
+
+TEST_CASE("VR controller frame insertion and timestamp shifts share the tail budget")
+{
+	const auto limitMs = dvb::kMaximumVRTrackedDurationMs;
+	json       event = Button(limitMs - 50, 1, "oculusPrimary", "down", 33);
+	event["wandIndex"] = 2;
+	const auto inserted = BuildVRTrackedSetReplay(json::array({ TrackingSample(0) }),
+		json::array({ event }), "recording:test", true);
+	CHECK(inserted["durationMs"] == limitMs);
+	CHECK(inserted["report"]["convertedControllerEvents"] == 1);
+	event["tMs"] = limitMs - 49;
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(json::array({ TrackingSample(0) }),
+						json::array({ event }), "recording:test", true),
+		std::invalid_argument);
+
+	event["tMs"] = limitMs - 51;
+	const auto shifted = BuildVRTrackedSetReplay(json::array({ TrackingSample(limitMs - 51) }),
+		json::array({ event }), "recording:test", true);
+	CHECK(shifted["durationMs"] == limitMs);
+	CHECK(shifted["report"]["timestampAdjustedControllerEvents"] == 1);
+	event["tMs"] = limitMs - 50;
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(json::array({ TrackingSample(limitMs - 50) }),
+						json::array({ event }), "recording:test", true),
+		std::invalid_argument);
+}
+
+TEST_CASE("disabled or empty VR replay does not allocate a tail")
+{
+	const auto disabled = BuildVRTrackedSetReplay(
+		json::array({ TrackingSample(dvb::kMaximumVRTrackedDurationMs) }),
+		json::array(), "recording:test", false);
+	CHECK(disabled["step"].is_null());
+	CHECK(disabled["durationMs"] == 0);
+	CHECK(disabled["inputOwner"] == "");
+	const auto empty = BuildVRTrackedSetReplay(json::array(), json::array(), "recording:test", true);
+	CHECK(empty["step"].is_null());
+	CHECK(empty["durationMs"] == 0);
+	CHECK(empty["inputOwner"] == "");
+}
+
 TEST_CASE("canonical VR replay enforces its final frame budget")
 {
 	json samples = json::array();
@@ -229,18 +288,9 @@ TEST_CASE("keyboard replay planning rejects wrong-typed ordering fields")
 
 TEST_CASE("same-millisecond controller transitions remain distinct atomic frames")
 {
-	const auto pose = [](int index) {
-		return json{ { "available", true }, { "connected", true }, { "valid", true },
-			{ "index", index }, { "trackingResult", 200 },
-			{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
-			{ "velocity", json::array({ 0, 0, 0 }) },
-			{ "angularVelocity", json::array({ 0, 0, 0 }) } };
-	};
 	const json samples = json::array({
-		json{ { "tMs", 10 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
-		json{ { "tMs", 20 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
+		TrackingSample(10),
+		TrackingSample(20),
 	});
 	json       down = Button(10, 1, "oculusPrimary", "down", 33);
 	down["wandIndex"] = 2;

@@ -2472,6 +2472,7 @@ namespace dvb
 			"The first stop request freezes both clocks, including across persistence retries. "
 			"Recordings longer than 30 minutes are observation evidence and cannot be replayed. "
 			"Replay step waits must be nonnegative integers; the combined atMs/wait clock is also capped at 30 minutes. "
+			"Generated VR input frames, including their 50 ms tail, must fit within the same replay limit. "
 			"'replay' runs a recording file ('path'): with restoreScene=true it re-establishes "
 			"the entryPoint and waits for the player before the trajectory, so the run reproduces "
 			"the recorded scene (interiors coc the cell; exterior entries use cow with the "
