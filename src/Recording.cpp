@@ -4,6 +4,7 @@
 #include "GameState.h"
 #include "MainThread.h"
 #include "RecordingActivity.h"
+#include "RecordingManifest.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 #include "VRInputState.h"
@@ -983,7 +984,7 @@ namespace dvb::Recording
 			return json{
 				{ "recording", rec.running.load() },
 				{ "state", RecorderStateName(rec.state) },
-				{ "correlationId", rec.manifest.value("correlationId", std::string{}) },
+				{ "correlationId", RecordingCorrelationId(rec.manifest) },
 				{ "sampleCount", rec.samples.size() },
 				{ "trackingSampleCount", rec.trackingSamples.size() },
 				{ "limitReached", rec.limitReached },
