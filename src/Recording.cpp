@@ -5,6 +5,7 @@
 #include "MainThread.h"
 #include "RecordingActivity.h"
 #include "RecordingManifest.h"
+#include "RecordingWindow.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 #include "VRInputState.h"
@@ -400,6 +401,7 @@ namespace dvb::Recording
 			idle,
 			starting,
 			running,
+			limited,
 			stopping,
 		};
 
@@ -412,6 +414,8 @@ namespace dvb::Recording
 				return "starting";
 			case RecorderState::running:
 				return "running";
+			case RecorderState::limited:
+				return "limited";
 			case RecorderState::stopping:
 				return "stopping";
 			}
@@ -437,6 +441,37 @@ namespace dvb::Recording
 			json                     manifest;
 			long                     intervalMs = kDefaultIntervalMs;
 			steady_clock::time_point startTick;
+			RecordingWindow          window;
+			std::int64_t             finalizedElapsedMs = 0;
+
+			std::int64_t ElapsedMs() const
+			{
+				if (!window.started)
+					return 0;
+				if (state == RecorderState::idle)
+					return finalizedElapsedMs;
+				return duration_cast<milliseconds>(steady_clock::now() - startTick).count();
+			}
+
+			void StopAtLimit(const char* reason)
+			{
+				window.End(ElapsedMs());
+				limitReached = true;
+				limitReason = reason;
+				state = RecorderState::limited;
+				running.store(false, std::memory_order_relaxed);
+				cv.notify_all();
+				logs::warn("devbench: recording limit at {}ms: {}; call record stop to persist", window.endedMs, reason);
+				Notify("devbench: recording limit reached — stop to save the capture");
+			}
+
+			bool CheckDurationLimit()
+			{
+				if (ElapsedMs() < window.maximumMs)
+					return true;
+				StopAtLimit("maximum recording duration reached");
+				return false;
+			}
 
 			void Sample(std::uint64_t a_generation)
 			{
@@ -447,7 +482,7 @@ namespace dvb::Recording
 					started = startTick;
 					interval = intervalMs;
 				}
-				const auto deadline = started + milliseconds(kMaximumVRTrackedDurationMs);
+				const auto deadline = started + milliseconds(window.maximumMs);
 				const auto waitFor = [&](milliseconds a_delay) {
 					std::unique_lock lock(mtx);
 					const auto       target = std::min(steady_clock::now() + a_delay, deadline);
@@ -459,9 +494,7 @@ namespace dvb::Recording
 					if (steady_clock::now() < deadline)
 						return true;
 					if (state == RecorderState::running && generation == a_generation) {
-						limitReached = true;
-						limitReason = "maximum replayable duration reached";
-						running.store(false, std::memory_order_relaxed);
+						StopAtLimit("maximum recording duration reached");
 					}
 					return false;
 				};
@@ -486,11 +519,10 @@ namespace dvb::Recording
 						continue;  // player not loaded (or the wait was aborted by stop)
 					}
 					const auto tMs = duration_cast<milliseconds>(steady_clock::now() - started).count();
-					if (tMs > kMaximumVRTrackedDurationMs) {
+					if (tMs >= window.maximumMs) {
 						std::lock_guard lock(mtx);
-						limitReached = true;
-						limitReason = "maximum replayable duration reached";
-						running.store(false, std::memory_order_relaxed);
+						if (state == RecorderState::running && generation == a_generation)
+							StopAtLimit("maximum recording duration reached");
 						break;
 					}
 					if (!tracking.is_null()) {
@@ -499,11 +531,10 @@ namespace dvb::Recording
 						std::lock_guard lock(mtx);
 						if (state == RecorderState::running && generation == a_generation) {
 							if (trackingSamples.size() + activityEvents.size() >= kMaximumVRTrackedFrames) {
-								limitReached = true;
-								limitReason = "maximum replayable tracking/activity frame budget reached";
-								running.store(false, std::memory_order_relaxed);
+								StopAtLimit("maximum replayable tracking/activity frame budget reached");
 							} else {
 								trackingSamples.push_back(std::move(tracking));
+								window.Sample(tMs);
 							}
 						}
 					}
@@ -535,11 +566,10 @@ namespace dvb::Recording
 					std::lock_guard lock(mtx);
 					if (state == RecorderState::running && generation == a_generation) {
 						if (samples.size() >= kMaximumRetainedPoseSamples) {
-							limitReached = true;
-							limitReason = "maximum retained trajectory sample budget reached";
-							running.store(false, std::memory_order_relaxed);
+							StopAtLimit("maximum retained trajectory sample budget reached");
 						} else {
 							samples.push_back(std::move(pose));
+							window.Sample(tMs);
 						}
 					}
 				}
@@ -569,13 +599,13 @@ namespace dvb::Recording
 			if (!a_generation || !rec.running.load(std::memory_order_relaxed) ||
 				rec.state != RecorderState::running || rec.generation != a_generation)
 				return;
-			a_event["tMs"] = duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count();
+			if (!rec.CheckDurationLimit())
+				return;
+			a_event["tMs"] = rec.ElapsedMs();
 			a_event["frame"] = game::CurrentFrame();
 			if (rec.activityEvents.size() >= kMaximumRetainedActivityEvents ||
 				rec.trackingSamples.size() + rec.activityEvents.size() >= kMaximumVRTrackedFrames) {
-				rec.limitReached = true;
-				rec.limitReason = "maximum replayable activity/tracking frame budget reached";
-				rec.running.store(false, std::memory_order_relaxed);
+				rec.StopAtLimit("maximum replayable activity/tracking frame budget reached");
 				return;
 			}
 			a_event["seq"] = rec.nextActivitySeq++;
@@ -681,6 +711,13 @@ namespace dvb::Recording
 			meta["activityCounts"] = SummarizeActivity(a_rec.activityEvents);
 			meta["trackingSampleCount"] = a_rec.trackingSamples.size();
 			meta["recordedMs"] = a_recordedMs;
+			meta["maximumDurationMs"] = a_rec.window.maximumMs;
+			meta["elapsedMs"] = a_rec.finalizedElapsedMs;
+			meta["unrecordedTailMs"] = a_rec.finalizedElapsedMs - a_recordedMs;
+			meta["lastSampleMs"] = a_rec.window.lastSampleMs;
+			meta["limitReached"] = a_rec.limitReached;
+			meta["limitReason"] = a_rec.limitReason;
+			meta["withinReplayDurationLimit"] = a_recordedMs <= kMaximumVRTrackedDurationMs;
 			meta["recordedAt"] = static_cast<long long>(std::time(nullptr));  // record-time epoch, for tooling
 			// Checkpoints marked live via record{action:"checkpoint"} during this session. Each
 			// entry's atMs is already the recorder's own elapsed-ms clock (steady_clock since
@@ -790,10 +827,13 @@ namespace dvb::Recording
 				cancelStart();
 				return json{ { "error", "intervalMs must be an integer" } };
 			}
-			long interval;
+			long         interval;
+			std::int64_t maximumDurationMs;
 			try {
 				interval = static_cast<long>(ParseBoundedIntegerArgument(a_args, "intervalMs",
 					g_defaultIntervalMs, kMinIntervalMs, kMaximumVRTrackedDurationMs));
+				maximumDurationMs = ParseBoundedIntegerArgument(a_args, "maximumDurationMs",
+					kMaximumRecordingDurationMs, kMinIntervalMs, kMaximumRecordingDurationMs);
 			} catch (const std::invalid_argument& e) {
 				cancelStart();
 				return json{ { "error", e.what() } };
@@ -857,6 +897,8 @@ namespace dvb::Recording
 				rec.manifest = std::move(manifest);
 				rec.intervalMs = interval;
 				rec.startTick = steady_clock::now();
+				rec.window.Start(maximumDurationMs);
+				rec.finalizedElapsedMs = 0;
 				const auto generation = ++rec.generation;
 				rec.running.store(true, std::memory_order_relaxed);
 				rec.state = RecorderState::running;
@@ -878,6 +920,7 @@ namespace dvb::Recording
 			Notify("devbench: recording started");
 			logs::info("devbench: recording started (interval {}ms)", interval);
 			return json{ { "action", "start" }, { "recording", true }, { "intervalMs", interval },
+				{ "maximumDurationMs", maximumDurationMs }, { "maximumRetainedFrames", kMaximumVRTrackedFrames },
 				{ "anchored", anchored }, { "correlationId", correlationId },
 				{ "activityCapture", ActivityCaptureContract() } };
 		}
@@ -901,8 +944,12 @@ namespace dvb::Recording
 			size_t count = 0;
 			{
 				std::lock_guard lock(rec.mtx);
-				if (rec.state != RecorderState::running)
+				if (rec.state != RecorderState::running || !rec.CheckDurationLimit())
 					return json{ { "error", "not recording — call action=start first" } };
+				if (rec.checkpoints.size() >= kMaximumVRTrackedFrames) {
+					rec.StopAtLimit("maximum retained checkpoint budget reached");
+					return json{ { "error", "checkpoint budget reached — stop to persist the recording" } };
+				}
 				atMs = static_cast<long>(duration_cast<milliseconds>(
 					steady_clock::now() - rec.startTick)
 						.count());
@@ -923,8 +970,10 @@ namespace dvb::Recording
 		if (action == "stop") {
 			{
 				std::lock_guard lock(rec.mtx);
-				if (rec.state != RecorderState::running)
+				if (rec.state != RecorderState::running && rec.state != RecorderState::limited)
 					return json{ { "error", "not recording" }, { "state", RecorderStateName(rec.state) } };
+				rec.finalizedElapsedMs = rec.ElapsedMs();
+				rec.window.End(rec.finalizedElapsedMs);
 				rec.state = RecorderState::stopping;
 				rec.running.store(false, std::memory_order_relaxed);
 			}
@@ -932,17 +981,16 @@ namespace dvb::Recording
 			if (rec.worker.joinable())
 				rec.worker.join();  // sampler done → samples are stable, no lock needed below
 
-			const long recordedMs = static_cast<long>(
-				duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count());
-			json     scenario;
-			fs::path path;
+			const long recordedMs = static_cast<long>(rec.window.RecordedMs(rec.finalizedElapsedMs));
+			json       scenario;
+			fs::path   path;
 			try {
 				scenario = BuildScenario(rec, recordedMs);
 				path = WriteScenarioFile(scenario);
 			} catch (const std::exception& e) {
 				std::lock_guard lock(rec.mtx);
-				rec.state = RecorderState::idle;
-				throw ToolError(500, std::format("recording stopped but could not be persisted: {}", e.what()));
+				rec.state = RecorderState::limited;
+				throw ToolError(500, std::format("recording stopped but could not be persisted; retry stop: {}", e.what()));
 			}
 
 			// generic_string(), not string(): a bare `dir / filename` join uses the native
@@ -967,6 +1015,9 @@ namespace dvb::Recording
 				{ "checkpointCount", rec.checkpoints.size() },
 				{ "activityCounts", activityCounts },
 				{ "recordedMs", recordedMs },
+				{ "elapsedMs", rec.finalizedElapsedMs },
+				{ "unrecordedTailMs", rec.finalizedElapsedMs - recordedMs },
+				{ "lastSampleMs", rec.window.lastSampleMs },
 				{ "limitReached", rec.limitReached },
 				{ "limitReason", rec.limitReason },
 				{ "path", pathStr },
@@ -989,6 +1040,14 @@ namespace dvb::Recording
 				{ "trackingSampleCount", rec.trackingSamples.size() },
 				{ "limitReached", rec.limitReached },
 				{ "limitReason", rec.limitReason },
+				{ "maximumDurationMs", rec.window.maximumMs },
+				{ "maximumRetainedFrames", kMaximumVRTrackedFrames },
+				{ "remainingTrackingActivityFrames", kMaximumVRTrackedFrames - rec.trackingSamples.size() - rec.activityEvents.size() },
+				{ "remainingPoseSamples", kMaximumRetainedPoseSamples - rec.samples.size() },
+				{ "elapsedMs", rec.ElapsedMs() },
+				{ "recordedMs", rec.window.RecordedMs(rec.ElapsedMs()) },
+				{ "remainingDurationMs", rec.window.RemainingMs(rec.ElapsedMs()) },
+				{ "lastSampleMs", rec.window.lastSampleMs },
 				{ "maximumReplayableFrames", kMaximumVRTrackedFrames },
 				{ "maximumReplayableDurationMs", kMaximumVRTrackedDurationMs },
 				{ "intervalMs", rec.intervalMs },
@@ -1038,6 +1097,8 @@ namespace dvb::Recording
 			if (rec.state != RecorderState::running || !rec.running.load(std::memory_order_relaxed) ||
 				rec.generation != generation)
 				return;
+			if (!rec.CheckDurationLimit())
+				return;
 			rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() },
 				{ "tMs", duration_cast<milliseconds>(steady_clock::now() - rec.startTick).count() } });
 			if (isCellTransition)
@@ -1065,6 +1126,8 @@ namespace dvb::Recording
 			if (!commandAlreadyCaptured) {
 				// Door and fast-travel transitions have no commanding console input. The caller
 				// supplies a reproducible coc/cow command and the trajectory refines the position.
+				if (!rec.CheckDurationLimit())
+					return;
 				rec.commands.push_back(json{ { "command", a_command }, { "frame", game::CurrentFrame() } });
 			}
 		}
@@ -1275,7 +1338,9 @@ namespace dvb::Recording
 
 		json steps = json::array();
 
-		const json        meta = rec.value("meta", json::object());
+		const json meta = rec.value("meta", json::object());
+		if (meta.value("recordedMs", std::int64_t{ 0 }) > kMaximumVRTrackedDurationMs)
+			throw ToolError(400, "observation recording exceeds the 30-minute replay duration limit; use a bounded recording for replay");
 		const json        entry = meta.value("entryPoint", json::object());
 		const std::string kind = entry.value("kind", std::string{});
 		const std::string value = entry.value("value", std::string{});
