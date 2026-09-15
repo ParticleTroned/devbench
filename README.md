@@ -250,7 +250,10 @@ input or scene mutation. Check `remainingDurationMs`,
 These are bounded recordings, not automatic file rotation or unlimited capture.
 
 `recordedMs` freezes when capture stops, including a limit stop. `elapsedMs`
-includes the delay until finalization, and `unrecordedTailMs` exposes that gap.
+includes the delay until the first `stop` request, and `unrecordedTailMs` exposes
+that gap in status, the stop response, and the file. Both clocks stay frozen
+during persistence and retries. Status and stop enforce the deadline even while
+the sampler is waiting for the game thread.
 `lastSampleMs` is the last retained pose/tracking sample and does not promise
 gap-free sampling during stalled frames or loading. Limit metadata persists in
 the file. A persistence error retains the stopped recording for another `stop`

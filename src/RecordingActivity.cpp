@@ -11,6 +11,34 @@
 
 namespace dvb::Recording
 {
+	void ValidateRecordingReplayDuration(const json& a_recording)
+	{
+		if (!a_recording.is_object())
+			throw std::invalid_argument("recording must be an object");
+		const json meta = a_recording.value("meta", json::object());
+		if (!meta.is_object())
+			throw std::invalid_argument("recording meta must be an object");
+		ParseBoundedIntegerArgument(meta, "recordedMs", 0, 0, kMaximumVRTrackedDurationMs);
+		ParseBoundedIntegerArgument(meta, "lastSampleMs", 0, 0, kMaximumVRTrackedDurationMs);
+
+		const auto validateStream = [](const json& parent, const char* stream, const char* timestamp) {
+			if (!parent.contains(stream))
+				return;
+			const auto& rows = parent.at(stream);
+			if (!rows.is_array())
+				throw std::invalid_argument(std::format("recording {} must be an array", stream));
+			for (const auto& row : rows) {
+				if (!row.is_object())
+					throw std::invalid_argument(std::format("recording {} entries must be objects", stream));
+				ParseBoundedIntegerArgument(row, timestamp, 0, 0, kMaximumVRTrackedDurationMs);
+			}
+		};
+		validateStream(a_recording, "steps", "atMs");
+		validateStream(a_recording, "activityEvents", "tMs");
+		validateStream(a_recording, "trackingSamples", "tMs");
+		validateStream(meta, "checkpoints", "atMs");
+	}
+
 	namespace
 	{
 		constexpr std::int64_t kRecordedHoldCapMs = 60000;

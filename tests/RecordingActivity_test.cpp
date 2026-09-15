@@ -3,11 +3,48 @@
 #include "RecordingActivity.h"
 #include "VRInputState.h"
 
+#include <limits>
+
 using dvb::json;
 using dvb::Recording::ActivityCaptureContract;
 using dvb::Recording::BuildVRTrackedSetReplay;
 using dvb::Recording::InterleaveReplayableActivity;
 using dvb::Recording::SummarizeActivity;
+using dvb::Recording::ValidateRecordingReplayDuration;
+
+TEST_CASE("replay duration accepts legacy metadata and the exact boundary")
+{
+	ValidateRecordingReplayDuration(json{ { "steps", json::array() } });
+	ValidateRecordingReplayDuration(json{
+		{ "meta", { { "recordedMs", dvb::kMaximumVRTrackedDurationMs },
+					  { "elapsedMs", 9000000 }, { "unrecordedTailMs", 7200000 } } },
+		{ "steps", json::array({ json{ { "atMs", dvb::kMaximumVRTrackedDurationMs } } }) },
+	});
+}
+
+TEST_CASE("replay duration rejects malformed and overflowing metadata")
+{
+	for (const json& duration : json::array({ -1, 1800001, 1800000.5, "100", nullptr, true,
+			 std::numeric_limits<std::uint64_t>::max() })) {
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{ { "meta", { { "recordedMs", duration } } } }),
+			std::invalid_argument);
+	}
+	CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{ { "meta", nullptr } }), std::invalid_argument);
+}
+
+TEST_CASE("overlong observation streams cannot bypass replay by omitting duration")
+{
+	for (const char* stream : { "steps", "activityEvents", "trackingSamples" }) {
+		const char* timestamp = std::string_view(stream) == "steps" ? "atMs" : "tMs";
+		json        recording{ { stream, json::array({ json{ { timestamp, 1800001 } } }) } };
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+		recording["meta"] = { { "recordedMs", 1 } };
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+	}
+	CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{
+						{ "meta", { { "checkpoints", json::array({ json{ { "atMs", 1800001 } } }) } } } }),
+		std::invalid_argument);
+}
 
 namespace
 {

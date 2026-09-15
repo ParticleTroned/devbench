@@ -14,8 +14,17 @@ namespace dvb::Recording
 		std::int64_t endedMs = -1;
 		std::int64_t lastSampleMs = 0;
 		bool         started = false;
+		std::int64_t finalizedElapsedMs = -1;
 
 		void                       Start(std::int64_t maximum) { *this = { maximum, -1, 0, true }; }
+		[[nodiscard]] std::int64_t ElapsedMs(std::int64_t elapsed) const
+		{
+			return started ? (finalizedElapsedMs < 0 ? elapsed : finalizedElapsedMs) : 0;
+		}
+		[[nodiscard]] bool DurationLimitReached(std::int64_t elapsed) const
+		{
+			return started && endedMs < 0 && elapsed >= maximumMs;
+		}
 		[[nodiscard]] std::int64_t RecordedMs(std::int64_t elapsed) const
 		{
 			return started ? std::clamp(endedMs < 0 ? elapsed : endedMs, std::int64_t{ 0 }, maximumMs) : 0;
@@ -28,6 +37,13 @@ namespace dvb::Recording
 		{
 			if (started && endedMs < 0)
 				endedMs = RecordedMs(elapsed);
+		}
+		/// Freeze the first stop request so persistence retries retain its timing.
+		void Finalize(std::int64_t elapsed)
+		{
+			End(elapsed);
+			if (started && finalizedElapsedMs < 0)
+				finalizedElapsedMs = std::max(elapsed, std::int64_t{ 0 });
 		}
 		void Sample(std::int64_t elapsed)
 		{
