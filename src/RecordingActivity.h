@@ -13,11 +13,13 @@ namespace dvb::Recording
 	json ActivityCaptureContract();
 	json SummarizeActivity(const json& a_events);
 
-	// Convert the synchronized OpenVR tracking stream plus legacy normalized controller events
-	// into one coherent tracked-set sequence step. New recordings already carry exact controller
-	// state in each tracking sample; older recording-3 captures are upgraded by inserting frames at
-	// controller event timestamps and carrying the most recent pose forward.
-	// Returns { step|null, report, inputOwner, durationMs }.
+	/// Reject invalid timestamps, waits, or an overlong combined replay clock.
+	/// Missing legacy metadata is allowed; retained stream timestamps are still checked.
+	void ValidateRecordingReplayDuration(const json& a_recording);
+
+	/// Build an atomic tracked-set sequence, upgrading legacy controller events with held poses.
+	/// Reject a generated duration, including the replay tail, beyond the replay limit.
+	/// Return { step|null, report, inputOwner, durationMs }; disabled/empty input has no tail.
 	json BuildVRTrackedSetReplay(const json& a_trackingSamples, const json& a_events,
 		const std::string& a_inputOwner, bool a_replayInputs);
 

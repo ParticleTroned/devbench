@@ -11,6 +11,41 @@
 
 namespace dvb::Recording
 {
+	void ValidateRecordingReplayDuration(const json& a_recording)
+	{
+		if (!a_recording.is_object())
+			throw std::invalid_argument("recording must be an object");
+		const json meta = a_recording.value("meta", json::object());
+		if (!meta.is_object())
+			throw std::invalid_argument("recording meta must be an object");
+		ParseBoundedIntegerArgument(meta, "recordedMs", 0, 0, kMaximumVRTrackedDurationMs);
+		ParseBoundedIntegerArgument(meta, "lastSampleMs", 0, 0, kMaximumVRTrackedDurationMs);
+
+		const auto validateStream = [](const json& parent, const char* stream, const char* timestamp,
+										bool includeWaits = false) {
+			if (!parent.contains(stream))
+				return;
+			const auto& rows = parent.at(stream);
+			if (!rows.is_array())
+				throw std::invalid_argument(std::format("recording {} must be an array", stream));
+			std::int64_t clockMs = 0;
+			for (const auto& row : rows) {
+				if (!row.is_object())
+					throw std::invalid_argument(std::format("recording {} entries must be objects", stream));
+				const auto atMs = ParseBoundedIntegerArgument(row, timestamp, 0, 0, kMaximumVRTrackedDurationMs);
+				if (includeWaits) {
+					// Absolute offsets advance replay before waits consume the remaining budget.
+					clockMs = std::max(clockMs, atMs);
+					clockMs += ParseBoundedIntegerArgument(row, "wait", 0, 0, kMaximumVRTrackedDurationMs - clockMs);
+				}
+			}
+		};
+		validateStream(a_recording, "steps", "atMs", true);
+		validateStream(a_recording, "activityEvents", "tMs");
+		validateStream(a_recording, "trackingSamples", "tMs");
+		validateStream(meta, "checkpoints", "atMs");
+	}
+
 	namespace
 	{
 		constexpr std::int64_t kRecordedHoldCapMs = 60000;
@@ -333,6 +368,8 @@ namespace dvb::Recording
 		}
 		const auto durationMs = frames.empty() ? 0 :
 		                                         frames.back().value("tMs", std::int64_t{ 0 }) + kReplayTailMs;
+		if (durationMs > kMaximumVRTrackedDurationMs)
+			throw std::invalid_argument("VR replay duration including its tail exceeds the replay duration limit");
 		report["emittedFrames"] = frames.size();
 		report["convertedControllerEvents"] = converted;
 		report["unsupportedControllerEvents"] = unsupported;

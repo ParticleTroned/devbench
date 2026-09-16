@@ -11,6 +11,7 @@
 #include "MainThread.h"
 #include "Papyrus.h"
 #include "Recording.h"
+#include "RecordingWindow.h"
 #include "ScenarioPolicy.h"
 #include "Server.h"
 #include "ToolExtensions.h"
@@ -2462,7 +2463,16 @@ namespace dvb
 			"a golden reference doesn't exist yet at mark-time. 'stop' "
 			"writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json "
 			"and returns its path + meta (meta.checkpoints holds any marked via 'checkpoint'). "
-			"'status' reports recording/sampleCount/intervalMs/checkpointCount/activityCounts. "
+			"Observation capture has a configurable maximumDurationMs (10..14400000, default four hours), "
+			"independent of the unchanged 30-minute replay limit. The retained pose and combined tracking/activity "
+			"budgets remain 60000 each; use a suitable intervalMs for long observations. At either limit, "
+			"status becomes limited, recording=false, and a HUD/log warning asks for stop to persist. "
+			"status reports remaining time/capacity, actual recordedMs and lastSampleMs; status, stop and metadata "
+			"also report elapsedMs and unrecordedTailMs without counting a delayed finalization as capture. "
+			"The first stop request freezes both clocks, including across persistence retries. "
+			"Recordings longer than 30 minutes are observation evidence and cannot be replayed. "
+			"Replay step waits must be nonnegative integers; the combined atMs/wait clock is also capped at 30 minutes. "
+			"Generated VR input frames, including their 50 ms tail, must fit within the same replay limit. "
 			"'replay' runs a recording file ('path'): with restoreScene=true it re-establishes "
 			"the entryPoint and waits for the player before the trajectory, so the run reproduces "
 			"the recorded scene (interiors coc the cell; exterior entries use cow with the "
@@ -2504,6 +2514,7 @@ namespace dvb
 			{ "properties", json{
 								{ "action", json{ { "type", "string" }, { "enum", json::array({ "start", "stop", "status", "replay", "checkpoint" }) }, { "description", "start | stop | status | replay | checkpoint" } } },
 								{ "intervalMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", kMaximumVRTrackedDurationMs }, { "description", "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs)" } } },
+								{ "maximumDurationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", Recording::kMaximumRecordingDurationMs }, { "description", "start: observation duration cap; default four hours; retained sample budgets and 30-minute replay cap are unchanged" } } },
 								{ "allowNoPlayer", json{ { "type", "boolean" }, { "description", "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)" } } },
 								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata" } } },
 								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },

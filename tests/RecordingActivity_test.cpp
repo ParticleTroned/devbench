@@ -3,14 +3,107 @@
 #include "RecordingActivity.h"
 #include "VRInputState.h"
 
+#include <limits>
+
 using dvb::json;
 using dvb::Recording::ActivityCaptureContract;
 using dvb::Recording::BuildVRTrackedSetReplay;
 using dvb::Recording::InterleaveReplayableActivity;
 using dvb::Recording::SummarizeActivity;
+using dvb::Recording::ValidateRecordingReplayDuration;
+
+TEST_CASE("replay duration accepts legacy metadata and the exact boundary")
+{
+	ValidateRecordingReplayDuration(json{ { "steps", json::array() } });
+	ValidateRecordingReplayDuration(json{
+		{ "meta", { { "recordedMs", dvb::kMaximumVRTrackedDurationMs },
+					  { "elapsedMs", 9000000 }, { "unrecordedTailMs", 7200000 } } },
+		{ "steps", json::array({ json{ { "atMs", dvb::kMaximumVRTrackedDurationMs } } }) },
+	});
+}
+
+TEST_CASE("replay duration rejects malformed and overflowing metadata")
+{
+	for (const json& duration : json::array({ -1, 1800001, 1800000.5, "100", nullptr, true,
+			 std::numeric_limits<std::uint64_t>::max() })) {
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{ { "meta", { { "recordedMs", duration } } } }),
+			std::invalid_argument);
+	}
+	CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{ { "meta", nullptr } }), std::invalid_argument);
+}
+
+TEST_CASE("overlong observation streams cannot bypass replay by omitting duration")
+{
+	for (const char* stream : { "steps", "activityEvents", "trackingSamples" }) {
+		const char* timestamp = std::string_view(stream) == "steps" ? "atMs" : "tMs";
+		json        recording{ { stream, json::array({ json{ { timestamp, 1800001 } } }) } };
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+		recording["meta"] = { { "recordedMs", 1 } };
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+	}
+	CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{
+						{ "meta", { { "checkpoints", json::array({ json{ { "atMs", 1800001 } } }) } } } }),
+		std::invalid_argument);
+}
+
+TEST_CASE("replay rejects invalid and overlong waits before planning")
+{
+	for (const json& wait : json::array({ -1, 1800001, 0.5, "100", nullptr, true,
+			 std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::uint64_t>::max() })) {
+		const json recording{ { "steps", json::array({ json{ { "wait", wait } } }) } };
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+	}
+}
+
+TEST_CASE("replay combines cumulative waits with forward and backward offsets")
+{
+	const json timelines = json::array({
+		json::array({ json{ { "wait", 900000 } }, json{ { "wait", 900001 } } }),
+		json::array({ json{ { "atMs", 1500000 }, { "wait", 300001 } } }),
+		json::array({ json{ { "wait", 1700000 } }, json{ { "atMs", 10 }, { "wait", 100001 } } }),
+	});
+	for (const auto& steps : timelines) {
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{ { "steps", steps } }), std::invalid_argument);
+		CHECK_THROWS_AS(ValidateRecordingReplayDuration(json{
+							{ "meta", { { "recordedMs", 1 } } }, { "steps", steps } }),
+			std::invalid_argument);
+	}
+}
+
+TEST_CASE("replay clock accepts the exact limit and agrees with activity planning")
+{
+	json recording{ { "steps", json::array({
+								   json{ { "wait", 0 } },
+								   json{ { "atMs", 100 }, { "wait", 10 } },
+								   json{ { "atMs", 50 }, { "wait", 20 } },
+								   json{ { "wait", 1799870 } },
+								   json{ { "atMs", 1800000 } },
+							   }) } };
+	ValidateRecordingReplayDuration(recording);
+	const auto   plan = InterleaveReplayableActivity(recording["steps"], json::array(), "recording:clock", true);
+	std::int64_t durationMs = 0;
+	for (const auto& step : plan["steps"])
+		durationMs += step.value("wait", std::int64_t{ 0 });
+	CHECK(durationMs == dvb::kMaximumVRTrackedDurationMs);
+	recording["steps"].push_back(json{ { "wait", 1 } });
+	CHECK_THROWS_AS(ValidateRecordingReplayDuration(recording), std::invalid_argument);
+}
 
 namespace
 {
+	json TrackingSample(std::int64_t a_ms)
+	{
+		const auto pose = [](int index) {
+			return json{ { "available", true }, { "connected", true }, { "valid", true },
+				{ "index", index }, { "trackingResult", 200 },
+				{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
+				{ "velocity", json::array({ 0, 0, 0 }) },
+				{ "angularVelocity", json::array({ 0, 0, 0 }) } };
+		};
+		return json{ { "tMs", a_ms }, { "originCode", 1 }, { "hmd", pose(0) },
+			{ "left", pose(1) }, { "right", pose(2) } };
+	}
+
 	json Button(std::int64_t a_ms, std::uint64_t a_seq, const char* a_device,
 		const char* a_state, int a_id)
 	{
@@ -49,18 +142,9 @@ TEST_CASE("activity summary separates replayable keyboard transitions from prese
 
 TEST_CASE("legacy controller events become atomic tracked-set frames without losing short presses")
 {
-	const auto pose = [](int index) {
-		return json{ { "available", true }, { "connected", true }, { "valid", true },
-			{ "index", index }, { "trackingResult", 200 },
-			{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
-			{ "velocity", json::array({ 0, 0, 0 }) },
-			{ "angularVelocity", json::array({ 0, 0, 0 }) } };
-	};
 	const json samples = json::array({
-		json{ { "tMs", 20 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
-		json{ { "tMs", 100 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
+		TrackingSample(20),
+		TrackingSample(100),
 	});
 	json       down = Button(40, 1, "oculusPrimary", "down", 33);
 	down["wandIndex"] = 2;
@@ -110,6 +194,61 @@ TEST_CASE("VR tracked-set replay rejects malformed source samples before returni
 		std::invalid_argument);
 }
 
+TEST_CASE("VR replay duration includes the full tail at the boundary")
+{
+	const auto limitMs = dvb::kMaximumVRTrackedDurationMs;
+	const auto plan = BuildVRTrackedSetReplay(json::array({ TrackingSample(limitMs - 50) }),
+		json::array(), "recording:test", true);
+	CHECK(plan["durationMs"] == limitMs);
+	CHECK(plan["report"]["durationMs"] == limitMs);
+	CHECK(plan["step"]["args"]["tailMs"] == 50);
+
+	for (const auto tMs : { limitMs - 49, limitMs }) {
+		CHECK_THROWS_AS(BuildVRTrackedSetReplay(json::array({ TrackingSample(tMs) }),
+							json::array(), "recording:test", true),
+			std::invalid_argument);
+	}
+}
+
+TEST_CASE("VR controller frame insertion and timestamp shifts share the tail budget")
+{
+	const auto limitMs = dvb::kMaximumVRTrackedDurationMs;
+	json       event = Button(limitMs - 50, 1, "oculusPrimary", "down", 33);
+	event["wandIndex"] = 2;
+	const auto inserted = BuildVRTrackedSetReplay(json::array({ TrackingSample(0) }),
+		json::array({ event }), "recording:test", true);
+	CHECK(inserted["durationMs"] == limitMs);
+	CHECK(inserted["report"]["convertedControllerEvents"] == 1);
+	event["tMs"] = limitMs - 49;
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(json::array({ TrackingSample(0) }),
+						json::array({ event }), "recording:test", true),
+		std::invalid_argument);
+
+	event["tMs"] = limitMs - 51;
+	const auto shifted = BuildVRTrackedSetReplay(json::array({ TrackingSample(limitMs - 51) }),
+		json::array({ event }), "recording:test", true);
+	CHECK(shifted["durationMs"] == limitMs);
+	CHECK(shifted["report"]["timestampAdjustedControllerEvents"] == 1);
+	event["tMs"] = limitMs - 50;
+	CHECK_THROWS_AS(BuildVRTrackedSetReplay(json::array({ TrackingSample(limitMs - 50) }),
+						json::array({ event }), "recording:test", true),
+		std::invalid_argument);
+}
+
+TEST_CASE("disabled or empty VR replay does not allocate a tail")
+{
+	const auto disabled = BuildVRTrackedSetReplay(
+		json::array({ TrackingSample(dvb::kMaximumVRTrackedDurationMs) }),
+		json::array(), "recording:test", false);
+	CHECK(disabled["step"].is_null());
+	CHECK(disabled["durationMs"] == 0);
+	CHECK(disabled["inputOwner"] == "");
+	const auto empty = BuildVRTrackedSetReplay(json::array(), json::array(), "recording:test", true);
+	CHECK(empty["step"].is_null());
+	CHECK(empty["durationMs"] == 0);
+	CHECK(empty["inputOwner"] == "");
+}
+
 TEST_CASE("canonical VR replay enforces its final frame budget")
 {
 	json samples = json::array();
@@ -149,18 +288,9 @@ TEST_CASE("keyboard replay planning rejects wrong-typed ordering fields")
 
 TEST_CASE("same-millisecond controller transitions remain distinct atomic frames")
 {
-	const auto pose = [](int index) {
-		return json{ { "available", true }, { "connected", true }, { "valid", true },
-			{ "index", index }, { "trackingResult", 200 },
-			{ "matrix", json::array({ 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 }) },
-			{ "velocity", json::array({ 0, 0, 0 }) },
-			{ "angularVelocity", json::array({ 0, 0, 0 }) } };
-	};
 	const json samples = json::array({
-		json{ { "tMs", 10 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
-		json{ { "tMs", 20 }, { "originCode", 1 }, { "hmd", pose(0) },
-			{ "left", pose(1) }, { "right", pose(2) } },
+		TrackingSample(10),
+		TrackingSample(20),
 	});
 	json       down = Button(10, 1, "oculusPrimary", "down", 33);
 	down["wandIndex"] = 2;
