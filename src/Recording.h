@@ -16,8 +16,10 @@ namespace RE
 // progress. Emits record.started / record.stopped on the EventBus as scenario markers.
 namespace dvb::Recording
 {
-	/// record tool handler. action = start | stop | status. Needs the EventBus to emit
-	/// the start/stop marker events; bound with a capturing lambda at registration.
+	/// record tool handler. action = start | stop | status | checkpoint | toggle.
+	/// Stop's optional expectedCorrelationId is checked before any capture mutation,
+	/// including limit finalization and persistence retries (400 invalid, 409 mismatch).
+	/// Uses the EventBus for start/stop markers, bound by the registration lambda.
 	/// (action=replay is handled at the registration site, which has the registry to run
 	/// the assembled scenario — see BuildReplaySteps.)
 	json Handle(const json& a_args, EventBus& a_events);

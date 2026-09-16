@@ -643,6 +643,7 @@ namespace dvb
 		}
 	}
 
+	/// Expose keyboard and VR actions, including physical observation, on both transports.
 	void RegisterInputTool(ToolRegistry& a_registry, EventBus& a_events)
 	{
 		KeyboardManager::Get().SetEvents(a_events);
@@ -679,7 +680,7 @@ namespace dvb
 		input.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "down", "up", "tap", "sequence", "stop", "releaseAll" }) } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "observe", "down", "up", "tap", "sequence", "stop", "releaseAll" }) } } },
 								{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard", "vrTrackedSet" }) }, { "description", "mutation/status device; omit for capabilities" } } },
 								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 255 } } }) }, { "description", "down/up/tap: documented key name or raw DirectInput scancode" } } },
 								{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },

@@ -19,6 +19,14 @@ pip install -r requirements.txt
 pytest tests/http -v
 ```
 
+Input discovery also has an offline regression suite. It validates the
+bridge fallback and checks that missing capability actions fail instead
+of skipping. It blocks HTTP requests and never contacts a running game:
+
+```sh
+python -m pytest tests/http/test_input_contract.py -q
+```
+
 If you have multiple game instances or a non-default port, point the suite at
 the right server explicitly:
 

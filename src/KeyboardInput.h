@@ -5,8 +5,8 @@ namespace dvb
 	class EventBus;
 	class ToolRegistry;
 
-	// Register the versioned `input` tool. Keyboard and the atomic VR tracked-set capability
-	// are advertised from kPostLoad; mutation reports 503 until their kInputLoaded seams exist.
+	/// Register the versioned input tool, including read-only physical VR observation.
+	/// Advertised from kPostLoad; mutation reports 503 until the kInputLoaded seams exist.
 	void RegisterInputTool(ToolRegistry& a_registry, EventBus& a_events);
 	void MarkKeyboardInputReady();
 

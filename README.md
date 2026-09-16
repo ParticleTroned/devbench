@@ -248,6 +248,18 @@ Other mods add their own tools via the C ABI (see [Use devbench from your mod](#
 
 ## Record, replay, and autorun
 
+For owned automation, start with a unique `correlationId` and pass it as
+`expectedCorrelationId` on `record` stop. DevBench checks that identity under
+the recorder mutex before changing capture state. A mismatch returns 409 and
+leaves the current recording running; an invalid guard returns 400. The guard
+also applies when finalizing a limited capture or retrying persistence. Calls
+without this optional guard retain their existing behavior.
+
+Both identifiers are limited to 128 UTF-8 bytes; a stop guard must also be
+nonempty. Use a new identifier for each capture, including replacements:
+the guard compares caller-supplied identifiers, not authenticated owners,
+and cannot distinguish captures that reuse the same identifier.
+
 Observation recording and replay have separate duration limits. Long tests can
 record for up to four hours by default; use `intervalMs=1000` for long state
 observations to leave room within the retained 60,000-sample budgets. Sampling
