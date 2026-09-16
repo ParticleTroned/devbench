@@ -14,6 +14,8 @@ namespace dvb::Recording
 	}
 
 	/// Validate an optional stop guard while holding the recorder mutex, before mutation.
+	/// Omission preserves legacy stops; invalid UTF-8 byte length/type throws 400 and
+	/// a missing or different recording identity throws 409 without changing the manifest.
 	inline void ValidateRecordingStopCorrelation(const json& args, const json& manifest)
 	{
 		const auto expected = args.find("expectedCorrelationId");
@@ -21,7 +23,7 @@ namespace dvb::Recording
 			return;
 		if (!expected->is_string() || expected->get_ref<const std::string&>().empty() ||
 			expected->get_ref<const std::string&>().size() > 128)
-			throw ToolError(400, "expectedCorrelationId must be a nonempty string of at most 128 characters");
+			throw ToolError(400, "expectedCorrelationId must be a nonempty string of at most 128 UTF-8 bytes");
 		const auto actual = RecordingCorrelationId(manifest);
 		if (expected->get_ref<const std::string&>() != actual)
 			throw ToolError(409, "recording correlation mismatch: expected " + expected->dump() + ", observed " + json(actual).dump());

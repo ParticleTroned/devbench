@@ -802,6 +802,7 @@ namespace dvb::Recording
 		}
 	}
 
+	/// Dispatch capture actions; guarded stops validate identity under the recorder mutex.
 	json Handle(const json& a_args, EventBus& a_events)
 	{
 		std::string action = a_args.value("action", std::string("status"));
@@ -871,7 +872,7 @@ namespace dvb::Recording
 			const std::string correlationId = a_args.value("correlationId", std::string{});
 			if (correlationId.size() > 128) {
 				cancelStart();
-				return json{ { "error", "correlationId must contain at most 128 characters" } };
+				return json{ { "error", "correlationId must contain at most 128 UTF-8 bytes" } };
 			}
 			if (!correlationId.empty())
 				manifest["correlationId"] = correlationId;

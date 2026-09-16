@@ -88,6 +88,9 @@ jobs:
           python -m pip install "pytest>=7.0" "requests>=2.28"
           python -m pytest tests/http/test_camera_freecam_safety.py tests/http/test_camera_freecam.py -q
 
+      - name: Check input discovery without a game
+        run: python -m pytest tests/http/test_input_contract.py -q
+
       - name: Stage binaries
         shell: pwsh
         run: |

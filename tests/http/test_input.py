@@ -10,8 +10,10 @@ from conftest import require_enum, require_tool, schema_enum
 
 
 def test_input_capability_contract(client, tool_schema):
+    """Every v2 capability action must be discoverable in the input schema."""
     desc = require_tool(tool_schema, "input")
-    require_enum(desc, "action", "capabilities")
+    advertised_actions = set(schema_enum(desc, "action"))
+    assert "capabilities" in advertised_actions, desc
     body = client.ok("input", {"action": "capabilities"})
     assert body.get("contract") == {
         "name": "devbench.input",
@@ -30,14 +32,16 @@ def test_input_capability_contract(client, tool_schema):
     vr_set = body.get("capabilities", {}).get("vrTrackedSet", {})
     assert vr_set.get("atomicDevices") == ["hmd", "left", "right"], body
     assert vr_set.get("passThroughWhenInactive") is True, body
-    assert "observe" in vr_set.get("actions", []), body
-    advertised_actions = set(schema_enum(desc, "action"))
+    assert {"status", "observe", "sequence", "stop", "releaseAll"} <= set(
+        vr_set.get("actions", [])
+    ), body
     for device, capability in body["capabilities"].items():
         missing = set(capability.get("actions", [])) - advertised_actions
         assert not missing, f"{device} capability actions missing from schema: {missing}"
 
 
 def test_keyboard_input_status_is_safe_without_player(client, tool_schema):
+    """Keyboard status remains read-only and available without a loaded player."""
     desc = require_tool(tool_schema, "input")
     require_enum(desc, "action", "status")
     body = client.ok("input", {"action": "status", "device": "keyboard"})

@@ -2197,6 +2197,7 @@ namespace dvb
 		}
 	}
 
+	/// Register built-in handlers and their shared REST/MCP discovery contracts.
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
 		RegisterInputTool(a_registry, a_events);
@@ -2518,8 +2519,8 @@ namespace dvb
 								{ "intervalMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", kMaximumVRTrackedDurationMs }, { "description", "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs)" } } },
 								{ "maximumDurationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", Recording::kMaximumRecordingDurationMs }, { "description", "start: observation duration cap; default four hours; retained sample budgets and 30-minute replay cap are unchanged" } } },
 								{ "allowNoPlayer", json{ { "type", "boolean" }, { "description", "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)" } } },
-								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata" } } },
-								{ "expectedCorrelationId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stop: optional atomic correlation guard; mismatch returns 409 without changing the recording" } } },
+								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata; at most 128 UTF-8 bytes" } } },
+								{ "expectedCorrelationId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stop: optional atomic correlation guard; nonempty, at most 128 UTF-8 bytes; invalid returns 400, mismatch returns 409 without changing the recording" } } },
 								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },
 								{ "excludeUi", json{ { "type", "boolean" }, { "description", "checkpoint: request a pre-UI capture source at replay (default true) — see the `capture` tool" } } },
 								{ "path", json{ { "type", "string" }, { "description", "replay: recording file to play back (from stop's 'path')" } } },

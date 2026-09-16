@@ -643,6 +643,7 @@ namespace dvb
 		}
 	}
 
+	/// Expose keyboard and VR actions, including physical observation, on both transports.
 	void RegisterInputTool(ToolRegistry& a_registry, EventBus& a_events)
 	{
 		KeyboardManager::Get().SetEvents(a_events);

@@ -451,12 +451,12 @@
             "type": "boolean"
           },
           "correlationId": {
-            "description": "start: caller correlation identifier retained in status and recording metadata",
+            "description": "start: caller correlation identifier retained in status and recording metadata; at most 128 UTF-8 bytes",
             "maxLength": 128,
             "type": "string"
           },
           "expectedCorrelationId": {
-            "description": "stop: optional atomic correlation guard; mismatch returns 409 without changing the recording",
+            "description": "stop: optional atomic correlation guard; nonempty, at most 128 UTF-8 bytes; invalid returns 400, mismatch returns 409 without changing the recording",
             "maxLength": 128,
             "minLength": 1,
             "type": "string"
