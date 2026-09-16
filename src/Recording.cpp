@@ -971,6 +971,7 @@ namespace dvb::Recording
 		if (action == "stop") {
 			{
 				std::lock_guard lock(rec.mtx);
+				ValidateRecordingStopCorrelation(a_args, rec.manifest);
 				if (rec.state != RecorderState::running && rec.state != RecorderState::limited)
 					return json{ { "error", "not recording" }, { "state", RecorderStateName(rec.state) } };
 				const auto elapsed = rec.ElapsedMs();

@@ -6,7 +6,7 @@ on unattended CI, while mutation belongs in an explicitly owned live automation 
 
 from __future__ import annotations
 
-from conftest import require_enum, require_tool
+from conftest import require_enum, require_tool, schema_enum
 
 
 def test_input_capability_contract(client, tool_schema):
@@ -31,6 +31,10 @@ def test_input_capability_contract(client, tool_schema):
     assert vr_set.get("atomicDevices") == ["hmd", "left", "right"], body
     assert vr_set.get("passThroughWhenInactive") is True, body
     assert "observe" in vr_set.get("actions", []), body
+    advertised_actions = set(schema_enum(desc, "action"))
+    for device, capability in body["capabilities"].items():
+        missing = set(capability.get("actions", [])) - advertised_actions
+        assert not missing, f"{device} capability actions missing from schema: {missing}"
 
 
 def test_keyboard_input_status_is_safe_without_player(client, tool_schema):

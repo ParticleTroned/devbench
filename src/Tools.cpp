@@ -2463,6 +2463,8 @@ namespace dvb
 			"a golden reference doesn't exist yet at mark-time. 'stop' "
 			"writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json "
 			"and returns its path + meta (meta.checkpoints holds any marked via 'checkpoint'). "
+			"Supply expectedCorrelationId to stop only the matching recording: comparison and transition "
+			"are atomic, and a mismatch returns 409 without stopping or finalizing the capture. "
 			"Observation capture has a configurable maximumDurationMs (10..14400000, default four hours), "
 			"independent of the unchanged 30-minute replay limit. The retained pose and combined tracking/activity "
 			"budgets remain 60000 each; use a suitable intervalMs for long observations. At either limit, "
@@ -2517,6 +2519,7 @@ namespace dvb
 								{ "maximumDurationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", Recording::kMaximumRecordingDurationMs }, { "description", "start: observation duration cap; default four hours; retained sample budgets and 30-minute replay cap are unchanged" } } },
 								{ "allowNoPlayer", json{ { "type", "boolean" }, { "description", "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)" } } },
 								{ "correlationId", json{ { "type", "string" }, { "maxLength", 128 }, { "description", "start: caller correlation identifier retained in status and recording metadata" } } },
+								{ "expectedCorrelationId", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stop: optional atomic correlation guard; mismatch returns 409 without changing the recording" } } },
 								{ "id", json{ { "type", "string" }, { "description", "checkpoint: unique id for this checkpoint (required)" } } },
 								{ "excludeUi", json{ { "type", "boolean" }, { "description", "checkpoint: request a pre-UI capture source at replay (default true) — see the `capture` tool" } } },
 								{ "path", json{ { "type", "string" }, { "description", "replay: recording file to play back (from stop's 'path')" } } },
