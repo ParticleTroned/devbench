@@ -1679,6 +1679,31 @@ namespace dvb
 			return v.get<uint64_t>();
 		}
 
+		std::atomic<uint64_t> g_activeReplayRunId{ 0 };
+
+		// Returns 0 on success, else the runId of the replay already in flight.
+		uint64_t ClaimActiveReplay(uint64_t a_runId)
+		{
+			uint64_t active = 0;
+			return g_activeReplayRunId.compare_exchange_strong(active, a_runId) ? 0 : active;
+		}
+
+		void ReleaseActiveReplay(uint64_t a_runId)
+		{
+			g_activeReplayRunId.compare_exchange_strong(a_runId, 0);
+		}
+
+		struct ActiveReplayClaim
+		{
+			uint64_t id;
+			bool     armed = true;
+			~ActiveReplayClaim()
+			{
+				if (armed)
+					ReleaseActiveReplay(id);
+			}
+		};
+
 		// Tracks in-flight/completed async runs — record{action:"replay"} (async by default) and
 		// scenario{action:"run", async:true} share this registry and its runId space, so a runId
 		// from either polls correctly via either tool's action="status". Entries are pruned once
@@ -2522,7 +2547,8 @@ namespace dvb
 			"regions?}}; a checkpoint with no matching entry is captured but not scored. The "
 			"result's top-level 'checkpoints' array rolls up every capture step into "
 			"{id, ok, path, inconclusive, inconclusiveReason?, ssim?, threshold?, passed?} — read "
-			"this instead of filtering the (often much larger) 'results' step transcript yourself.";
+			"this instead of filtering the (often much larger) 'results' step transcript yourself."
+			" Only one replay runs at a time: starting another while one is in flight is refused with 409 naming the active runId.";
 		record.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2566,7 +2592,12 @@ namespace dvb
 					for (const auto& s : steps)
 						if (s.contains("wait"))
 							estMs += s["wait"].get<long>();
-					const uint64_t    runId = RunRegistry::Get().NextId();
+					const uint64_t runId = RunRegistry::Get().NextId();
+					if (const uint64_t active = ClaimActiveReplay(runId)) {
+						Recording::Notify("devbench: can't replay — a replay is already playing");
+						throw ToolError(409, std::format("replay blocked: replay run {} is still in progress — wait for it to finish (poll record{{action:'status', runId:{}}}) before starting another", active, active));
+					}
+					ActiveReplayClaim claimGuard{ runId };
 					const json        activity = plan.value("activity", json::object());
 					const std::string inputOwner = plan.value("inputOwner", std::string{});
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
@@ -2582,7 +2613,8 @@ namespace dvb
 					const json coupling = plan.value("coupling", json::object());
 					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
 											   activity, inputOwner]() -> json {
-						const auto releaseRecordedInput = [&]() -> json {
+						ActiveReplayClaim activeReplayGuard{ runId };
+						const auto        releaseRecordedInput = [&]() -> json {
 							if (inputOwner.empty())
 								return json{ { "needed", false } };
 							ToolContext inputCtx = a_ctx;
@@ -2658,6 +2690,7 @@ namespace dvb
 								RunRegistry::Get().Fail(runId, e.what());
 							}
 						}).detach();
+						claimGuard.armed = false;
 					} catch (const std::exception& e) {
 						RunRegistry::Get().Fail(runId, e.what());
 						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false },
