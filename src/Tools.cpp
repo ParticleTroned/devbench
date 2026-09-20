@@ -87,9 +87,6 @@ namespace dvb
 			const std::string action = a_args.value("action", std::string("exec"));
 
 			if (action == "read") {
-				// Slice ConsoleLog's buffer between the fence markers, on the main thread
-				// (the buffer is written there). markersFound=true → lines are exactly the
-				// fenced command's output.
 				return MainThread::RunAndWait([]() -> json {
 					const auto r = ConsoleLogCapture::ReadFenced(200);
 					json       arr = json::array();
@@ -101,6 +98,24 @@ namespace dvb
 						{ "sawEnd", r.sawEnd },
 						{ "count", arr.size() },
 						{ "lines", std::move(arr) },
+						{ "source", r.source },
+						{ "lossPossible", r.lossPossible },
+						{ "diag", json{
+									  { "consoleLogNull", r.consoleLogNull },
+									  { "bufferEmpty", r.bufferEmpty },
+									  { "bufferLen", r.bufferLen },
+									  { "bufferHasBegin", r.bufferHasBegin },
+									  { "lastMessage", r.lastMessage },
+									  { "lastMessageHasBegin", r.lastMessageHasBegin },
+									  { "consoleMenuExists", r.consoleMenuExists },
+									  { "consoleMenuOpen", r.consoleMenuOpen },
+									  { "consoleMode", r.consoleMode },
+									  { "ringLines", r.ringLines },
+									  { "samples", r.samples },
+									  { "ticks", r.ticks },
+									  { "engineFrames", r.engineFrames },
+									  { "timedOut", r.timedOut },
+								  } },
 					};
 				});
 			}
@@ -135,19 +150,12 @@ namespace dvb
 
 			const bool capture = a_args.contains("capture") && Truthy(a_args["capture"]);
 
-			// ExecuteCommand is deferred (GFx console drains queued commands on a later
-			// tick). Fence the real command between two invalid marker commands so a later
-			// action='read' can slice ConsoleLog's buffer between their echoed tokens.
-			// Capture `command` by value so it outlives this lambda.
-			task->AddTask([command, capture]() {
-				if (capture)
-					RE::Console::ExecuteCommand(ConsoleLogCapture::kMarkerBegin);
-				RE::Console::ExecuteCommand(command.c_str());
-				if (capture)
-					RE::Console::ExecuteCommand(ConsoleLogCapture::kMarkerEnd);
-			});
-
-			return json{ { "queued", true }, { "command", command }, { "capturing", capture } };
+			if (!capture) {
+				task->AddTask([command]() { RE::Console::ExecuteCommand(command.c_str()); });
+				return json{ { "queued", true }, { "command", command }, { "capturing", false } };
+			}
+			const bool completed = ConsoleLogCapture::RunFencedCapture(command);
+			return json{ { "queued", false }, { "command", command }, { "capturing", true }, { "completed", completed } };
 		}
 
 		namespace fs = std::filesystem;
@@ -2267,11 +2275,16 @@ namespace dvb
 		console.name = "console";
 		console.description =
 			"Run a Skyrim console command. action='exec' (default) queues `command` onto the main "
-			"thread (runs next tick). With capture=true it is fenced between marker commands; a "
-			"later action='read' slices ConsoleLog's buffer between the markers and returns the "
-			"command's output as { markersFound, lines:[…] }. Useful for printing commands "
-			"(getav, getgs, getpos, help). Read promptly after exec — heavy ConsoleLog spam can "
-			"scroll the markers out of the buffer (then markersFound=false, no wrong data). "
+			"thread (runs next tick). With capture=true it is fenced between marker commands and exec "
+			"returns once the output has landed, so a following action='read' returns the command's "
+			"output as { markersFound, lines:[...], source, lossPossible }. source='buffer' is complete, "
+			"including several lines printed in one frame (e.g. `help`). source='sampler' is used once "
+			"the Console menu has been created, when the game stops filling that buffer: it sees one "
+			"line per frame, so a command that prints SEVERAL lines in a frame keeps only the last "
+			"(lossPossible=true); getav, getgs and getpos are exact. A second capture while one is "
+			"running gets 409. exec then returns { queued:false, completed }, completed=false meaning "
+			"the end marker never arrived and `lines` may be incomplete; a capture that never sees its "
+			"begin marker gets 504 and the command is not run. "
 			"`save <name>`/`load <name>` are rerouted to the `game` tool's BGSSaveLoadManager "
 			"path and return { redirected:'game' } — running them as raw console commands "
 			"deadlocks the engine (SkyrimVM::Freeze vs blocked main loop).";
