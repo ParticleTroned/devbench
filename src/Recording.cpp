@@ -5,6 +5,7 @@
 #include "InputHotkeys.h"
 #include "MainThread.h"
 #include "RecordingActivity.h"
+#include "ReplayTrajectory.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 #include "VRInputState.h"
@@ -1248,6 +1249,11 @@ namespace dvb::Recording
 		}
 	}
 
+	bool WantsPoseDriver(const json& a_args)
+	{
+		return a_args.value("interpolate", true);
+	}
+
 	json BuildReplaySteps(const json& a_args)
 	{
 		std::string path = a_args.value("path", std::string{});
@@ -1291,6 +1297,9 @@ namespace dvb::Recording
 		}
 		if (!rec.contains("steps") || !rec["steps"].is_array())
 			throw ToolError(400, "recording has no 'steps' array");
+		if (WantsPoseDriver(a_args))
+			rec["steps"] = ScaleWaitsToRecordedDuration(rec["steps"],
+				rec.value("meta", json::object()).value("recordedMs", static_cast<std::int64_t>(0)));
 
 		json steps = json::array();
 

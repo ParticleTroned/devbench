@@ -11,6 +11,8 @@
 #include "MainThread.h"
 #include "Papyrus.h"
 #include "Recording.h"
+#include "ReplayDriver.h"
+#include "ReplayTrajectory.h"
 #include "ScenarioPolicy.h"
 #include "Server.h"
 #include "ToolExtensions.h"
@@ -1825,7 +1827,10 @@ namespace dvb
 				~ReplayGuard() { Recording::SetReplaying(false); }
 			} replayGuard;
 
+			Recording::ReplayDriver::Playback playback(steps, a_args.value("smoothPose", false));
+
 			for (int rep = 0; rep < repeat && !aborted; ++rep) {
+				playback.Finish();
 				// Per-repetition, not per-run: a scene mismatch on rep N must not poison rep N+1's
 				// captures if rep N+1's own scene assert succeeds.
 				bool runSceneMismatch = false;
@@ -1860,7 +1865,12 @@ namespace dvb
 					}
 
 					try {
-						if (step.contains("pose")) {
+						if (playback.Handle(step)) {
+							r["kind"] = "pose";
+							r["ok"] = true;
+							if (step.contains("wait"))
+								playback.Sleep(step["wait"].get<long>());
+						} else if (step.contains("pose")) {
 							// Compact trajectory sample [x, y, z, yawDeg, pitchDeg] → the same
 							// player.setpos/setangle commands v1 stored as five steps (Recording::BuildScenario).
 							const json& p = step["pose"];
@@ -1909,7 +1919,7 @@ namespace dvb
 							const long ms = step["wait"].get<long>();
 							r["kind"] = "wait";
 							r["ms"] = ms;
-							std::this_thread::sleep_for(milliseconds(ms));
+							playback.Sleep(ms);
 						} else if (step.contains("waitFor")) {
 							const WaitForSpec spec = ParseWaitFor(step);
 							const long        timeoutMs = step.value("timeoutMs", static_cast<long>(60000));
@@ -2121,13 +2131,17 @@ namespace dvb
 				}
 			}
 
-			return json{
+			playback.Finish();
+			json summary{
 				{ "ok", !anyFailure },
 				{ "aborted", aborted },
 				{ "stepsRun", results.size() },
 				{ "elapsedMs", duration_cast<milliseconds>(steady_clock::now() - t0).count() },
 				{ "results", std::move(results) },
 			};
+			if (!playback.Stats().is_null())
+				summary["poseDriver"] = playback.Stats();
+			return summary;
 		}
 	}
 
@@ -2568,6 +2582,7 @@ namespace dvb
 								{ "force", json{ { "type", "boolean" }, { "description", "replay: proceed even if the scene doesn't match the recording — report the mismatch as a warning instead of aborting (default false)" } } },
 								{ "closeMenus", json{ { "type", "boolean" }, { "description", "replay: cancel an open MODAL (e.g. the Survival Mode prompt a scene transition can raise) instead of erroring, both at start and at the post-restore menu guard; non-modal gameplay menus still error (default false)" } } },
 								{ "async", json{ { "type", "boolean" }, { "description", "replay: return {queued:true, runId} immediately and run in the background (default true); false blocks and returns the result directly" } } },
+								{ "interpolate", json{ { "type", "boolean" }, { "description", "replay: drive the player along the recorded path once per engine frame with interpolated position/yaw/pitch on an absolute clock, instead of one teleport per sample. Result carries poseDriver stats; false keeps per-sample teleports (default true)" } } },
 								{ "runId", json{ { "type", "integer" }, { "description", "status: poll an async replay run started earlier (from replay's 'runId')" } } },
 							} },
 		};
@@ -2611,8 +2626,9 @@ namespace dvb
 					// copies. replay.finished must publish on EVERY exit -- a poller waiting on
 					// it would otherwise hang when a step throws.
 					const json coupling = plan.value("coupling", json::object());
+					const bool interpolate = Recording::WantsPoseDriver(a_args);
 					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
-											   activity, inputOwner]() -> json {
+											   activity, inputOwner, interpolate]() -> json {
 						ActiveReplayClaim activeReplayGuard{ runId };
 						const auto        releaseRecordedInput = [&]() -> json {
 							if (inputOwner.empty())
@@ -2656,7 +2672,8 @@ namespace dvb
 							const json initialCleanup = releaseRecordedInput();
 							if (!initialCleanup.value("ok", true))
 								throw ToolError(409, "recorded input cleanup is still pending; retry after controller/key restoration succeeds");
-							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
+							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId }, { "smoothPose", interpolate } },
+								a_ctx, a_registry, a_events);
 						} catch (const std::exception& e) {
 							const json cleanup = releaseRecordedInput();
 							a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
