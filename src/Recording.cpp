@@ -597,8 +597,7 @@ namespace dvb::Recording
 
 		// Build a replayable scenario: teleport the player to each sample (per-axis setpos +
 		// setangle in degrees) with a wait of intervalMs between, so the captured path doubles
-		// as the measure window. Player-teleport replay needs no new engine hooks; smooth
-		// interpolation and a free-camera path are later enhancements.
+		// as the measure window. On VR, the camera is driven separately (see ReplayDriver).
 		json BuildScenario(const Recorder& a_rec, long a_recordedMs)
 		{
 			const auto consoleStep = [](const std::string& a_cmd, long a_atMs) {
@@ -613,11 +612,14 @@ namespace dvb::Recording
 					step["atMs"] = a_atMs;
 				return step;
 			};
-
+			// The VR camera is driven live at replay time (see ReplayDriver::State::DriveCamera),
+			// not from a discrete per-sample step here.
 			json                  steps = json::array();
 			std::string           lastPov;     // emit a camera step only when the POV changes
 			std::array<double, 5> lastPose{};  // previous emitted pose (round-2); a repeat → bare wait
 			bool                  havePose = false;
+			std::array<double, 5> lastCamPose{};  // previous emitted camera pose (round-4)
+			bool                  haveCamPose = false;
 			size_t                cmdIdx = 0;    // drain console commands captured up to each sample's frame
 			long                  prevTMs = -1;  // previous sample's wall-clock offset for delta waits
 			for (const auto& s : a_rec.samples) {
@@ -644,14 +646,30 @@ namespace dvb::Recording
 					r2(s.value("angleZ", 0.0) * kRadToDeg),
 					r2(s.value("angleX", 0.0) * kRadToDeg),  // pitch
 				};
+				// Tracked independently of pose so a head-turn-only sample still gets a row.
+				bool                        haveThisCam = s.contains("camX") && s.contains("camPitch");
+				const auto                  roundToFourDecimals = [](double v) { return std::round(v * 10000.0) / 10000.0; };
+				const std::array<double, 5> camPose{
+					roundToFourDecimals(s.value("camX", 0.0)),
+					roundToFourDecimals(s.value("camY", 0.0)),
+					roundToFourDecimals(s.value("camZ", 0.0)),
+					roundToFourDecimals(s.value("camPitch", 0.0)),
+					roundToFourDecimals(s.value("camYaw", 0.0)),
+				};
+				const bool camChanged = haveThisCam && (!haveCamPose || camPose != lastCamPose);
 				const long waitMs = (tMs > 0 && prevTMs >= 0) ? std::max(1L, tMs - prevTMs) : a_rec.intervalMs;
 				json       row{ { "wait", waitMs } };
 				if (tMs >= 0)
 					row["atMs"] = tMs;
-				if (!havePose || pose != lastPose) {
+				if (!havePose || pose != lastPose || camChanged) {
 					row["pose"] = pose;
 					lastPose = pose;
 					havePose = true;
+				}
+				if (camChanged) {
+					row["camPose"] = camPose;
+					lastCamPose = camPose;
+					haveCamPose = true;
 				}
 				steps.push_back(std::move(row));
 				prevTMs = tMs;
@@ -689,7 +707,9 @@ namespace dvb::Recording
 				{ "camera", json::array({ "worldPosition", "worldPitch", "worldYaw", "pov" }) },
 				{ "vrTrackedNodes", json::array({ "hmd", "leftWand", "rightWand" }) },
 				{ "transformEncoding", "[tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22,scale]" },
-				{ "vrTransformReplay", false },
+				// Informational only; replay no longer branches on this.
+				{ "vrTransformReplay", std::any_of(a_rec.samples.begin(), a_rec.samples.end(),
+										   [](const json& s) { return s.contains("camX") && s.contains("camPitch"); }) },
 			};
 			meta["activityCounts"] = SummarizeActivity(a_rec.activityEvents);
 			meta["trackingSampleCount"] = a_rec.trackingSamples.size();
@@ -1515,6 +1535,8 @@ namespace dvb::Recording
 		const json& trajectory = activityPlan["steps"];
 		long        cumMs = 0;
 		size_t      cpIdx = 0;
+		// Everything above is restore/settle; the replay camera hold only activates from here on.
+		const std::size_t trajectoryStepCount = steps.size();
 		if (!vrPlan.value("step", json(nullptr)).is_null())
 			steps.push_back(vrPlan["step"]);
 		for (const auto& s : trajectory) {
@@ -1557,6 +1579,7 @@ namespace dvb::Recording
 								std::string{} },
 			{ "restored", restored },  // handler's sync menu pre-check skips restore plans (the load clears menus)
 			{ "allowsInitialMenus", allowsInitialMenus },
+			{ "trajectoryStepCount", trajectoryStepCount },  // the replay camera hold activates from here on
 			{ "coupling", json{
 							  { "tier", tier },
 							  { "producer", producerTier },
