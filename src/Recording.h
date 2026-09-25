@@ -57,6 +57,10 @@ namespace dvb::Recording
 	/// hook) are the trajectory — so a recording that plays back a recipe embeds it cleanly.
 	void SetReplaying(bool a_replaying);
 
+	/// True while a recording is running (start..stop), so a caller can refuse work that would
+	/// make the capture incomparable — e.g. changing the game's time scale mid-recording.
+	bool IsActive();
+
 	/// Default settle delay (ms) inserted after a restore-load before the trajectory, so the
 	/// game settles before the player is teleported. Local/per-machine (set from config);
 	/// a replay call's settleMs arg overrides it.
@@ -96,6 +100,8 @@ namespace dvb::Recording
 	/// isn't registered throws ToolError(409) before anything runs, unless a_args.force or the
 	/// capability's own allowNative permits the low-fidelity native fallback.
 	json BuildReplaySteps(const json& a_args);
+
+	bool WantsPoseDriver(const json& a_args);
 
 	/// `recordings` tool: manage the on-disk recording library (the data layer an in-game menu —
 	/// SMF/FUCK/built-in — sits on). action = list | describe | validate | delete.

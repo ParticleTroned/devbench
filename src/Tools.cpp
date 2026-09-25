@@ -3,6 +3,7 @@
 #include "Capture.h"
 #include "ConsoleLogCapture.h"
 #include "EventBus.h"
+#include "FreeCamera.h"
 #include "GameEvents.h"
 #include "GameState.h"
 #include "HostApi.h"
@@ -12,11 +13,13 @@
 #include "Papyrus.h"
 #include "Recording.h"
 #include "RecordingWindow.h"
+#include "ReplayDriver.h"
+#include "ReplayTrajectory.h"
 #include "ScenarioPolicy.h"
 #include "Server.h"
+#include "TimeScaleControl.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
-#include "VRFreeCamera.h"
 #include "VRInputState.h"
 #include "Version.h"
 
@@ -25,6 +28,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <optional>
 #include <thread>
@@ -46,14 +50,29 @@ namespace dvb
 			return false;
 		}
 
+		bool BooleanArgument(const json& a_object, const char* a_name, bool a_default)
+		{
+			if (!a_object.contains(a_name))
+				return a_default;
+			if (!a_object[a_name].is_boolean())
+				throw ToolError(400, std::format("'{}' must be a boolean", a_name));
+			return a_object[a_name].get<bool>();
+		}
+
+		// A time-scale lease is owned by whoever set it, so an unrelated caller cannot renew or
+		// release it (see TimeScaleControl).
+		std::string LeaseOwner(const ToolContext& a_ctx)
+		{
+			return a_ctx.clientId.empty() ? std::string("rest:anonymous") : "mcp:" + a_ctx.clientId;
+		}
+
 		json GameHandler(const json& a_args, const ToolContext& a_ctx);
 
-		// Console `save`/`load` run the whole save/load synchronously inside the GFx
-		// console drain, off the engine's sanctioned save point: the save job spins in
-		// SkyrimVM::Freeze waiting for Papyrus stacks that only the (blocked) main loop
-		// can drain — an engine-level deadlock that reproduces with every devbench hook
-		// disabled. Reroute those commands to the BGSSaveLoadManager request path the
-		// `game` tool uses, which the engine services at its own save point.
+		// Console `save` runs the whole save synchronously inside the GFx console
+		// drain, off the engine's sanctioned save point: a worker can block in
+		// SkyrimVM::Freeze on the main thread's VM lock while the main thread waits
+		// for that worker. Reroute save/load to the `game` tool, which queues named
+		// saves through SKSE and keeps the save-name lookup and load checks together.
 		std::optional<json> RedirectConsoleSaveLoad(const std::string& a_command, const ToolContext& a_ctx)
 		{
 			const auto  sp = a_command.find(' ');
@@ -86,9 +105,6 @@ namespace dvb
 			const std::string action = a_args.value("action", std::string("exec"));
 
 			if (action == "read") {
-				// Slice ConsoleLog's buffer between the fence markers, on the main thread
-				// (the buffer is written there). markersFound=true → lines are exactly the
-				// fenced command's output.
 				return MainThread::RunAndWait([]() -> json {
 					const auto r = ConsoleLogCapture::ReadFenced(200);
 					json       arr = json::array();
@@ -100,6 +116,24 @@ namespace dvb
 						{ "sawEnd", r.sawEnd },
 						{ "count", arr.size() },
 						{ "lines", std::move(arr) },
+						{ "source", r.source },
+						{ "lossPossible", r.lossPossible },
+						{ "diag", json{
+									  { "consoleLogNull", r.consoleLogNull },
+									  { "bufferEmpty", r.bufferEmpty },
+									  { "bufferLen", r.bufferLen },
+									  { "bufferHasBegin", r.bufferHasBegin },
+									  { "lastMessage", r.lastMessage },
+									  { "lastMessageHasBegin", r.lastMessageHasBegin },
+									  { "consoleMenuExists", r.consoleMenuExists },
+									  { "consoleMenuOpen", r.consoleMenuOpen },
+									  { "consoleMode", r.consoleMode },
+									  { "ringLines", r.ringLines },
+									  { "samples", r.samples },
+									  { "ticks", r.ticks },
+									  { "engineFrames", r.engineFrames },
+									  { "timedOut", r.timedOut },
+								  } },
 					};
 				});
 			}
@@ -134,19 +168,12 @@ namespace dvb
 
 			const bool capture = a_args.contains("capture") && Truthy(a_args["capture"]);
 
-			// ExecuteCommand is deferred (GFx console drains queued commands on a later
-			// tick). Fence the real command between two invalid marker commands so a later
-			// action='read' can slice ConsoleLog's buffer between their echoed tokens.
-			// Capture `command` by value so it outlives this lambda.
-			task->AddTask([command, capture]() {
-				if (capture)
-					RE::Console::ExecuteCommand(ConsoleLogCapture::kMarkerBegin);
-				RE::Console::ExecuteCommand(command.c_str());
-				if (capture)
-					RE::Console::ExecuteCommand(ConsoleLogCapture::kMarkerEnd);
-			});
-
-			return json{ { "queued", true }, { "command", command }, { "capturing", capture } };
+			if (!capture) {
+				task->AddTask([command]() { RE::Console::ExecuteCommand(command.c_str()); });
+				return json{ { "queued", true }, { "command", command }, { "capturing", false } };
+			}
+			const bool completed = ConsoleLogCapture::RunFencedCapture(command);
+			return json{ { "queued", false }, { "command", command }, { "capturing", true }, { "completed", completed } };
 		}
 
 		namespace fs = std::filesystem;
@@ -204,6 +231,11 @@ namespace dvb
 		constexpr const char* kLoadNote =
 			"async — watch lifecycle 'postLoadGame' / inspect playerLoaded for completion. "
 			"A content-mismatch MessageBoxMenu (Yes/No) may gate it; check `menu` action=list.";
+
+		// game setTimeScale: how long to wait for the engine to actually reach the requested speed
+		// (the reconciler applies it on the next main-thread frame, and the engine then ramps).
+		constexpr int kScaleApplyTimeoutMs = 2000;
+		constexpr int kScalePollMs = 5;
 
 		// A Pascal-style string in the .ess header: uint16 length + that many raw (non-UTF16,
 		// despite the community name "wstring") bytes.
@@ -324,10 +356,10 @@ namespace dvb
 				a_out["metaNote"] = "none of the matched saves' .ess headers could be read";
 		}
 
-		// game: programmatic save / load / list via BGSSaveLoadManager. loadLast gives a
-		// settled real-save state for testing WITHOUT coc's heavy new-game init. Mutating
-		// actions run on the main thread and are async — see kLoadNote.
-		json GameHandler(const json& a_args, const ToolContext&)
+		// game: programmatic save / load / list. Named saves use SKSE's Game.SaveGame
+		// request; loads use BGSSaveLoadManager. loadLast gives a settled real-save
+		// state for testing WITHOUT coc's heavy new-game init. Both are async — see kLoadNote.
+		json GameHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string{});
 
@@ -434,6 +466,50 @@ namespace dvb
 				});
 			}
 
+			if (action == "getTimeScale")
+				return TimeScaleControl::Status();
+
+			if (action == "setTimeScale") {
+				const auto scaleArg = a_args.find("scale");
+				const bool freeze = BooleanArgument(a_args, "freeze", false);
+				if (scaleArg == a_args.end() && !freeze)
+					throw ToolError(400, "game setTimeScale: 'scale' is required (or freeze:true, which means scale 0)");
+				if (scaleArg != a_args.end() && !scaleArg->is_number())
+					throw ToolError(400, std::format("game setTimeScale: invalid scale '{}' (must be a number)", scaleArg->dump()));
+
+				const auto validation = TimeScaleControl::Validate(
+					scaleArg != a_args.end() ? scaleArg->get<double>() : TimeScaleControl::kFreezeScale,
+					freeze, BooleanArgument(a_args, "allowHigh", false));
+				if (!validation.accepted)
+					throw ToolError(400, std::format("game setTimeScale: {}", validation.error));
+
+				std::int64_t holdMs = TimeScaleControl::kDefaultLeaseMs;
+				if (const auto holdArg = a_args.find("holdMs"); holdArg != a_args.end()) {
+					if (!holdArg->is_number_integer())
+						throw ToolError(400, std::format("game setTimeScale: invalid holdMs '{}' (must be a positive integer)", holdArg->dump()));
+					holdMs = holdArg->get<std::int64_t>();
+					if (holdMs <= 0 || holdMs > TimeScaleControl::kMaximumLeaseMs)
+						throw ToolError(400, std::format("game setTimeScale: 'holdMs' must be 1..{}", TimeScaleControl::kMaximumLeaseMs));
+				}
+
+				const TimeScaleControl::SetResult set = TimeScaleControl::Set(validation.value, holdMs,
+					LeaseOwner(a_ctx), BooleanArgument(a_args, "allowTimeScale", false));
+				if (!set.ok)
+					throw ToolError(409, std::format("game setTimeScale: {}", set.error));
+
+				// The reconciler applies this on the next engine frame and the engine then ramps
+				// toward it, so report only once it is actually running at the requested speed.
+				const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kScaleApplyTimeoutMs);
+				while (std::fabs(TimeScaleControl::Effective() - validation.value) > TimeScaleControl::kEffectiveTolerance) {
+					if (std::chrono::steady_clock::now() >= deadline)
+						throw ToolError(504, std::format("game setTimeScale: the engine is still at {} after {}ms (requested {})", TimeScaleControl::Effective(), kScaleApplyTimeoutMs, validation.value));
+					std::this_thread::sleep_for(std::chrono::milliseconds(kScalePollMs));
+				}
+				json out = TimeScaleControl::Status();
+				out["applied"] = true;
+				return out;
+			}
+
 			auto* task = SKSE::GetTaskInterface();
 			if (!task)
 				throw ToolError(500, "SKSE TaskInterface unavailable");
@@ -471,22 +547,25 @@ namespace dvb
 						throw ToolError(404, std::format("save '{}' not found in {} — use action='list' for valid names", name, saveDir.string()));
 					Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
 				}
-				task->AddTask([name, isSave]() {
-					auto* m = RE::BGSSaveLoadManager::GetSingleton();
-					if (!m)
-						return;
-					if (isSave)
-						m->Save(name.c_str());
-					else
+				if (isSave) {
+					// SKSE tasks can run on worker threads. Synchronous Save can deadlock
+					// against the main thread's VM lock, so use SKSE's save request.
+					Papyrus::QueueCall(json{ { "script", "Game" }, { "function", "SaveGame" }, { "args", json::array({ name }) } });
+				} else {
+					task->AddTask([name]() {
+						auto* m = RE::BGSSaveLoadManager::GetSingleton();
+						if (!m)
+							return;
 						m->Load(name.c_str(), false);  // checkForMods=false skips the mod-mismatch modal
-				});
+					});
+				}
 				logs::info("devbench: game {} '{}'", action, name);
 				json out{ { "queued", true }, { "action", action }, { "name", name } };
 				if (!isSave)
 					out["note"] = kLoadNote;
 				return out;
 			}
-			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|advanceTime)", action));
+			throw ToolError(400, std::format("unknown action '{}' (list|save|load|loadLast|advanceTime|getTimeScale|setTimeScale)", action));
 		}
 
 		bool ContainsCI(const std::string& a_hay, const std::string& a_needle);  // defined below (near CheckState)
@@ -1329,7 +1408,7 @@ namespace dvb
 					else if (cam->currentState && cam->currentState->id == RE::CameraState::kAutoVanity)
 						pov = "vanity";  // kAutoVanity=1 is identical in SE/VR layouts
 					json out{ { "pov", pov }, { "freeCam", cam->IsInFreeCameraMode() },
-						{ "freeCamOwned", VRFreeCamera::IsOwned() },
+						{ "freeCamOwned", FreeCamera::IsOwned() },
 						{ "stateId", cam->currentState ? json(static_cast<std::uint32_t>(cam->currentState->id)) : json(nullptr) },
 						{ "freeCamBackend", REL::Module::IsVR() ? "vr-state" : "engine" } };
 					if (cam->cameraRoot) {
@@ -1345,25 +1424,15 @@ namespace dvb
 					return out;
 				});
 			}
-			auto* task = SKSE::GetTaskInterface();
-			if (!task)
-				throw ToolError(500, "SKSE TaskInterface unavailable");
-
-			// VR transitions complete on the main thread; flat-game toggles remain deferred.
+			// Both runtimes complete on the main thread and read back the same tick (see
+			// FreeCamera::SetEnabled/Drive) rather than queuing a fire-and-forget toggle.
 			if (action == "freecam") {
 				const bool on = a_args.value("on", true);
-				if (REL::Module::IsVR()) {
-					const auto session = VRFreeCamera::CurrentSession();
-					return MainThread::RunAndWait([on, session]() {
-						VRFreeCamera::SetEnabled(on, session);
-						return json{ { "queued", false }, { "action", "freecam" }, { "on", on }, { "freeCam", on } };
-					});
-				}
-				task->AddTask([on]() {
-					if (auto* cam = RE::PlayerCamera::GetSingleton(); cam && cam->IsInFreeCameraMode() != on)
-						cam->ToggleFreeCameraMode(false);  // false: don't freeze time
+				const auto session = FreeCamera::CurrentSession();
+				return MainThread::RunAndWait([on, session]() {
+					FreeCamera::SetEnabled(on, session);
+					return json{ { "queued", false }, { "action", "freecam" }, { "on", on }, { "freeCam", on } };
 				});
-				return json{ { "queued", true }, { "action", "freecam" }, { "on", on } };
 			}
 
 			// drive: set the free camera's world transform — the exact-viewpoint replay primitive.
@@ -1374,23 +1443,11 @@ namespace dvb
 				const float pitch = a_args.value("pitch", 0.0f), yaw = a_args.value("yaw", 0.0f);
 				if (!std::isfinite(x) || !std::isfinite(y) || !std::isfinite(z) || !std::isfinite(pitch) || !std::isfinite(yaw))
 					throw ToolError(400, "camera drive requires finite coordinates and angles");
-				if (REL::Module::IsVR()) {
-					const auto session = VRFreeCamera::CurrentSession();
-					return MainThread::RunAndWait([x, y, z, pitch, yaw, session]() {
-						VRFreeCamera::Drive(x, y, z, pitch, yaw, session);
-						return json{ { "queued", false }, { "action", "drive" } };
-					});
-				}
-				task->AddTask([x, y, z, pitch, yaw]() {
-					auto* cam = RE::PlayerCamera::GetSingleton();
-					if (!cam || !cam->currentState || cam->currentState->id != RE::CameraState::kFree)
-						return;  // not in free cam — issue camera freecam {on:true} first
-					auto* fc = static_cast<RE::FreeCameraState*>(cam->currentState.get());
-					fc->translation = RE::NiPoint3{ x, y, z };
-					fc->rotation.x = pitch;  // BEST-EFFORT free-cam rotation convention — tune in-game
-					fc->rotation.y = yaw;
+				const auto session = FreeCamera::CurrentSession();
+				return MainThread::RunAndWait([x, y, z, pitch, yaw, session]() {
+					FreeCamera::Drive(x, y, z, pitch, yaw, session);
+					return json{ { "queued", false }, { "action", "drive" } };
 				});
-				return json{ { "queued", true }, { "action", "drive" } };
 			}
 
 			if (action != "setPov")
@@ -1615,6 +1672,30 @@ namespace dvb
 			}
 		}
 
+		constexpr int  kModalCloseChecks = 20;
+		constexpr auto kModalCloseInterval = milliseconds(50);
+
+		// Cancels an open modal, never affirms it. The modal closes on a later frame, so this polls
+		// instead of re-checking once.
+		std::vector<std::string> BlockingMenusAfterClosingModals(bool a_closeModals)
+		{
+			auto blocking = BlockingMenus();
+			if (blocking.empty() || !a_closeModals)
+				return blocking;
+			const bool allModal = std::all_of(blocking.begin(), blocking.end(),
+				[](const std::string& n) { return n == RE::MessageBoxMenu::MENU_NAME; });
+			if (!allModal)
+				return blocking;
+			CancelActiveModal();
+			for (int i = 0; i < kModalCloseChecks; ++i) {
+				blocking = BlockingMenus();
+				if (blocking.empty())
+					break;
+				std::this_thread::sleep_for(kModalCloseInterval);
+			}
+			return blocking;
+		}
+
 		// Live-state conditions for waitUntil. playerLoaded marshals to the main thread;
 		// a mid-load stall (RunAndWait 504) just means "not yet" → keep polling. Menu
 		// conditions read the thread-safe tracked set (no marshal).
@@ -1655,6 +1736,31 @@ namespace dvb
 				throw ToolError(400, std::format("invalid runId '{}' (must be a non-negative integer)", v.dump()));
 			return v.get<uint64_t>();
 		}
+
+		std::atomic<uint64_t> g_activeReplayRunId{ 0 };
+
+		// Returns 0 on success, else the runId of the replay already in flight.
+		uint64_t ClaimActiveReplay(uint64_t a_runId)
+		{
+			uint64_t active = 0;
+			return g_activeReplayRunId.compare_exchange_strong(active, a_runId) ? 0 : active;
+		}
+
+		void ReleaseActiveReplay(uint64_t a_runId)
+		{
+			g_activeReplayRunId.compare_exchange_strong(a_runId, 0);
+		}
+
+		struct ActiveReplayClaim
+		{
+			uint64_t id;
+			bool     armed = true;
+			~ActiveReplayClaim()
+			{
+				if (armed)
+					ReleaseActiveReplay(id);
+			}
+		};
 
 		// Tracks in-flight/completed async runs — record{action:"replay"} (async by default) and
 		// scenario{action:"run", async:true} share this registry and its runId space, so a runId
@@ -1743,8 +1849,10 @@ namespace dvb
 		};
 
 		/// Execute a scenario step list and return its complete transcript.
+		// a_beforeStep, when set, is called with each step's index right before it runs.
 		json ScenarioHandler(const json& a_args, const ToolContext& a_ctx,
-			const ToolRegistry& a_registry, EventBus& a_events)
+			const ToolRegistry& a_registry, EventBus& a_events,
+			const std::function<void(std::size_t)>& a_beforeStep = {})
 		{
 			if (!a_args.contains("steps") || !a_args["steps"].is_array())
 				throw ToolError(400, "scenario requires a 'steps' array");
@@ -1777,11 +1885,16 @@ namespace dvb
 				~ReplayGuard() { Recording::SetReplaying(false); }
 			} replayGuard;
 
+			Recording::ReplayDriver::Playback playback(steps, a_args.value("smoothPose", false));
+
 			for (int rep = 0; rep < repeat && !aborted; ++rep) {
+				playback.Finish();
 				// Per-repetition, not per-run: a scene mismatch on rep N must not poison rep N+1's
 				// captures if rep N+1's own scene assert succeeds.
 				bool runSceneMismatch = false;
 				for (size_t i = 0; i < steps.size() && !aborted; ++i) {
+					if (a_beforeStep)
+						a_beforeStep(i);
 					const json& step = steps[i];
 					json        r{ { "index", i } };
 					if (repeat > 1)
@@ -1812,7 +1925,12 @@ namespace dvb
 					}
 
 					try {
-						if (step.contains("pose")) {
+						if (playback.Handle(step)) {
+							r["kind"] = "pose";
+							r["ok"] = true;
+							if (step.contains("wait") && !playback.Sleep(step["wait"].get<long>()))
+								throw ToolError(504, "replay wait stalled — the main thread did not advance game time within the wall-clock backstop");
+						} else if (step.contains("pose")) {
 							// Compact trajectory sample [x, y, z, yawDeg, pitchDeg] → the same
 							// player.setpos/setangle commands v1 stored as five steps (Recording::BuildScenario).
 							const json& p = step["pose"];
@@ -1854,14 +1972,16 @@ namespace dvb
 							}
 							if (poseOk) {
 								r["ok"] = true;
-								if (step.contains("wait"))
-									std::this_thread::sleep_for(milliseconds(step["wait"].get<long>()));
+								if (step.contains("wait") && !playback.Sleep(step["wait"].get<long>()))
+									throw ToolError(504, "replay wait stalled — the main thread did not advance game time within the wall-clock backstop");
 							}
 						} else if (step.contains("wait")) {
 							const long ms = step["wait"].get<long>();
 							r["kind"] = "wait";
 							r["ms"] = ms;
-							std::this_thread::sleep_for(milliseconds(ms));
+							if (!playback.Sleep(ms))
+								throw ToolError(504, "replay wait stalled — the main thread did not advance game time within the wall-clock backstop");
+							r["ok"] = true;
 						} else if (step.contains("waitFor")) {
 							const WaitForSpec spec = ParseWaitFor(step);
 							const long        timeoutMs = step.value("timeoutMs", static_cast<long>(60000));
@@ -1958,7 +2078,7 @@ namespace dvb
 							r["assert"] = what;
 							if (what == "noBlockingMenu") {
 								// Fail (409) if a menu/modal would eat the trajectory; name the offenders.
-								const auto blocking = BlockingMenus();
+								const auto blocking = BlockingMenusAfterClosingModals(step.value("closeModals", false));
 								r["ok"] = blocking.empty();
 								if (!blocking.empty()) {
 									r["openMenus"] = blocking;
@@ -2073,13 +2193,17 @@ namespace dvb
 				}
 			}
 
-			return json{
+			playback.Finish();
+			json summary{
 				{ "ok", !anyFailure },
 				{ "aborted", aborted },
 				{ "stepsRun", results.size() },
 				{ "elapsedMs", duration_cast<milliseconds>(steady_clock::now() - t0).count() },
 				{ "results", std::move(results) },
 			};
+			if (!playback.Stats().is_null())
+				summary["poseDriver"] = playback.Stats();
+			return summary;
 		}
 	}
 
@@ -2206,14 +2330,19 @@ namespace dvb
 		console.name = "console";
 		console.description =
 			"Run a Skyrim console command. action='exec' (default) queues `command` onto the main "
-			"thread (runs next tick). With capture=true it is fenced between marker commands; a "
-			"later action='read' slices ConsoleLog's buffer between the markers and returns the "
-			"command's output as { markersFound, lines:[…] }. Useful for printing commands "
-			"(getav, getgs, getpos, help). Read promptly after exec — heavy ConsoleLog spam can "
-			"scroll the markers out of the buffer (then markersFound=false, no wrong data). "
-			"`save <name>`/`load <name>` are rerouted to the `game` tool's BGSSaveLoadManager "
-			"path and return { redirected:'game' } — running them as raw console commands "
-			"deadlocks the engine (SkyrimVM::Freeze vs blocked main loop).";
+			"thread (runs next tick). With capture=true it is fenced between marker commands and exec "
+			"returns once the output has landed, so a following action='read' returns the command's "
+			"output as { markersFound, lines:[...], source, lossPossible }. source='buffer' is complete, "
+			"including several lines printed in one frame (e.g. `help`). source='sampler' is used once "
+			"the Console menu has been created, when the game stops filling that buffer: it sees one "
+			"line per frame, so a command that prints SEVERAL lines in a frame keeps only the last "
+			"(lossPossible=true); getav, getgs and getpos are exact. A second capture while one is "
+			"running gets 409. exec then returns { queued:false, completed }, completed=false meaning "
+			"the end marker never arrived and `lines` may be incomplete; a capture that never sees its "
+			"begin marker gets 504 and the command is not run. "
+			"`save <name>`/`load <name>` are rerouted to the `game` tool's save/load "
+			"path and return { redirected:'game' } — saves use SKSE's queued request "
+			"to avoid synchronous save deadlocks (SkyrimVM::Freeze vs blocked main loop).";
 		console.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2242,17 +2371,30 @@ namespace dvb
 			"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
 			"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
 			"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
-			"read back the same tick; runs synchronously on the main thread.";
+			"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
+			"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
+			"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
+			"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
+			"it returns { requested, effective, applied, owner, leaseRemainingMs } only once the "
+			"engine is actually running at the requested scale (the reconciler applies it on the next "
+			"frame and the engine then ramps). It is refused (409) while a recording or a capture is "
+			"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without "
+			"changing anything.";
 		game.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "advanceTime" }) }, { "description", "list | save | load | loadLast | advanceTime" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "advanceTime", "getTimeScale", "setTimeScale" }) }, { "description", "list | save | load | loadLast | advanceTime | getTimeScale | setTimeScale" } } },
 								{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load; from action='list')" } } },
 								{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath)" } } },
 								{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
 								{ "limit", json{ { "type", "integer" }, { "description", "list only: cap the number of saves returned (newest-first); must be > 0 if given" } } },
 								{ "detail", json{ { "type", "boolean" }, { "description", "list only: add per-save character/location/level metadata (default false)" } } },
 								{ "hours", json{ { "type", "number" }, { "description", "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)" } } },
+								{ "scale", json{ { "type", "number" }, { "description", "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)" } } },
+								{ "holdMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)" } } },
+								{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
+								{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
+								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
 							} },
 		};
 		a_registry.Register(std::move(game), &GameHandler);
@@ -2267,20 +2409,28 @@ namespace dvb
 			"| vanity) on the main thread and returns { pov: <applied>, requestedPov } read back "
 			"the same tick — Skyrim's idle-vanity timer can still override it a few ticks later "
 			"while the player is stationary, so poll action='get' if you need certainty after "
-			"idling. action='freecam' (param 'on', default true) enables or disables free camera. "
-			"On VR, freeCamBackend='vr-state': activation and restoration complete before return "
-			"(queued=false), using the existing VR state without changing freeze time. On SE/AE "
-			"the native toggle is queued; poll action='get'.freeCam before 'drive'. "
+			"idling. action='freecam' (param 'on', default true) enables or disables free camera on "
+			"either runtime: activation and restoration complete before return (queued=false) and "
+			"read back the same tick, without changing freeze time. freeCamBackend reports which "
+			"mechanism is in play: VR ('vr-state') hand-drives the transition, since the engine's "
+			"own toggle never installs free-cam as the current state on VR 1.4.15; flat ('engine') "
+			"uses the engine's own toggle, which enters and restores correctly there. "
 			"action='drive' (params 'x','y','z','pitch','yaw', all default 0) "
 			"sets the free camera's world transform — requires free-cam mode already on. "
-			"VR pitch/yaw are native free-camera angles in radians; SE/AE writes them to "
-			"FreeCameraState::rotation using the existing best-effort convention. "
-			"VR enable, disable, and drive reject an active camera owned elsewhere; freeCamOwned reports devbench ownership. "
-			"After failed pre-load restoration, freecam off retries recovery using the loaded scene's normal VR state; "
-			"unavailable or rejected recovery returns HTTP 500. "
-			"VR drive completes its field writes before return; allow a rendered frame before capture. "
+			"pitch/yaw are native free-camera angles in radians on both runtimes, writing "
+			"FreeCameraState::rotation directly; completes its field writes before return, so allow "
+			"a rendered frame before capture. "
+			"enable, disable, and drive all reject an active free camera owned elsewhere; "
+			"freeCamOwned reports devbench's own ownership. "
+			"On VR, after failed pre-load restoration, freecam off retries recovery using the "
+			"loaded scene's normal VR state; unavailable or rejected recovery returns HTTP 500. "
 			"Recordings capture the POV per sample and replay restores it via this tool, since "
-			"what is rendered (and benchmarked) differs by POV.";
+			"what is rendered (and benchmarked) differs by POV. A recording also captures the "
+			"camera's own world transform per sample, on whichever runtime recorded it; "
+			"record{action:'replay'} drives it exactly via this tool's freecam+drive instead of "
+			"setPov, since head-look is a degree of freedom setpos+setPov can't reproduce, on "
+			"either runtime. Devbench's own replay always owns and releases the free camera itself "
+			"for that duration.";
 		camera.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2290,8 +2440,8 @@ namespace dvb
 								{ "x", json{ { "type", "number" }, { "description", "drive: world X (requires free-cam mode)" } } },
 								{ "y", json{ { "type", "number" }, { "description", "drive: world Y (requires free-cam mode)" } } },
 								{ "z", json{ { "type", "number" }, { "description", "drive: world Z (requires free-cam mode)" } } },
-								{ "pitch", json{ { "type", "number" }, { "description", "drive: VR native free-cam pitch in radians; SE/AE best-effort FreeCameraState::rotation.x" } } },
-								{ "yaw", json{ { "type", "number" }, { "description", "drive: VR native free-cam yaw in radians; SE/AE best-effort FreeCameraState::rotation.y" } } },
+								{ "pitch", json{ { "type", "number" }, { "description", "drive: native free-cam pitch in radians (FreeCameraState::rotation.x)" } } },
+								{ "yaw", json{ { "type", "number" }, { "description", "drive: native free-cam yaw in radians (FreeCameraState::rotation.y)" } } },
 							} },
 		};
 		a_registry.Register(std::move(camera), &CameraHandler);
@@ -2511,7 +2661,15 @@ namespace dvb
 			"regions?}}; a checkpoint with no matching entry is captured but not scored. The "
 			"result's top-level 'checkpoints' array rolls up every capture step into "
 			"{id, ok, path, inconclusive, inconclusiveReason?, ssim?, threshold?, passed?} — read "
-			"this instead of filtering the (often much larger) 'results' step transcript yourself.";
+			"this instead of filtering the (often much larger) 'results' step transcript yourself."
+			" Only one replay runs at a time: starting another while one is in flight is refused with 409 naming the active runId. "
+			"Pass 'timeScale' (0.1..3.0, up to 10.0 with 'allowHigh':true) to replay the whole run that many times "
+			"faster — the trajectory is paced in GAME time, so the run keeps its shape and a mid-run change is absorbed; "
+			"the setup/restore phase before the trajectory (coc/cow + settle) always runs at normal speed, since a load "
+			"screen isn't sped up by this and its settle physics stay predictable; the scale is restored when the run "
+			"ends, and the result reports goldensEligible plus timeScaleChanges[] (a scaled run is not comparable to a "
+			"golden, which is reported rather than refused). 'start' is refused (409) while the game is running at a "
+			"scale other than 1, and both 'start' and 'replay' can override that with allowTimeScale:true.";
 		record.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
@@ -2531,8 +2689,12 @@ namespace dvb
 								{ "goldens", json{ { "type", "object" }, { "description", "replay: per-checkpoint SSIM comparison config, keyed by checkpoint id — {\"<id>\": {golden, threshold?, regions?}} — see the `capture` tool. Never stored in the recording itself; supply it fresh per replay so the same recording can check against different variants' goldens." } } },
 								{ "coupling", json{ { "type", "string" }, { "enum", json::array({ "anchored", "cell", "worldspace" }) }, { "description", "replay: override the recipe's coupling tier — run looser than the producer signaled (worldspace skips the scene restore)" } } },
 								{ "force", json{ { "type", "boolean" }, { "description", "replay: proceed even if the scene doesn't match the recording — report the mismatch as a warning instead of aborting (default false)" } } },
-								{ "closeMenus", json{ { "type", "boolean" }, { "description", "replay: if a MODAL is open at start, cancel it and continue instead of erroring; non-modal gameplay menus still error (default false)" } } },
+								{ "closeMenus", json{ { "type", "boolean" }, { "description", "replay: cancel an open MODAL (e.g. the Survival Mode prompt a scene transition can raise) instead of erroring, both at start and at the post-restore menu guard; non-modal gameplay menus still error (default false)" } } },
 								{ "async", json{ { "type", "boolean" }, { "description", "replay: return {queued:true, runId} immediately and run in the background (default true); false blocks and returns the result directly" } } },
+								{ "interpolate", json{ { "type", "boolean" }, { "description", "replay: drive the player along the recorded path once per engine frame with interpolated position/yaw/pitch on an absolute clock, instead of one teleport per sample. Result carries poseDriver stats; false keeps per-sample teleports (default true)" } } },
+								{ "timeScale", json{ { "type", "number" }, { "description", "replay: run the recorded trajectory this many times faster (0.1..3.0, up to 10.0 with allowHigh:true) and restore the previous scale when it ends — the setup/restore phase runs at normal speed regardless. The result reports goldensEligible plus timeScaleChanges[]" } } },
+								{ "allowHigh", json{ { "type", "boolean" }, { "description", "replay: permit a timeScale above 3.0, up to 10.0" } } },
+								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "start/replay: proceed while the game's time scale is not 1 (start would record an incomparable run; default false)" } } },
 								{ "runId", json{ { "type", "integer" }, { "description", "status: poll an async replay run started earlier (from replay's 'runId')" } } },
 							} },
 		};
@@ -2548,34 +2710,62 @@ namespace dvb
 					// load/coc clears menus, so those defer to the in-trajectory guard step). closeMenus
 					// clears a blocking MODAL (cancel, never affirm); a non-modal menu still errors.
 					if (!plan.value("restored", false) && !plan.value("allowsInitialMenus", false)) {
-						auto blocking = BlockingMenus();
-						if (!blocking.empty()) {
-							const bool allModal = std::all_of(blocking.begin(), blocking.end(),
-								[](const std::string& n) { return n == RE::MessageBoxMenu::MENU_NAME; });
-							if (a_args.value("closeMenus", false) && allModal) {
-								CancelActiveModal();
-								// The modal dismisses through the UI queue on a later frame, so poll (up
-								// to ~1s) rather than re-checking instantly — an instant check still sees
-								// the closing modal and would 409 spuriously.
-								for (int i = 0; i < 20; ++i) {
-									blocking = BlockingMenus();
-									if (blocking.empty())
-										break;
-									std::this_thread::sleep_for(milliseconds(50));
-								}
-							}
-							if (!blocking.empty())
-								throw ToolError(409, std::format("replay blocked: menu(s) open: [{}] — close them (menu tool) then retry; a modal can be cleared with closeMenus:true", JoinNames(blocking)));
-						}
+						const auto blocking = BlockingMenusAfterClosingModals(a_args.value("closeMenus", false));
+						if (!blocking.empty())
+							throw ToolError(409, std::format("replay blocked: menu(s) open: [{}] — close them (menu tool) then retry; a modal can be cleared with closeMenus:true", JoinNames(blocking)));
 					}
 					const json steps = plan.value("steps", json::array());
 					long       estMs = 0;  // sum of wait steps ≈ replay duration
 					for (const auto& s : steps)
 						if (s.contains("wait"))
 							estMs += s["wait"].get<long>();
-					const uint64_t    runId = RunRegistry::Get().NextId();
+					const uint64_t runId = RunRegistry::Get().NextId();
+					if (const uint64_t active = ClaimActiveReplay(runId)) {
+						Recording::Notify("devbench: can't replay — a replay is already playing");
+						throw ToolError(409, std::format("replay blocked: replay run {} is still in progress — wait for it to finish (poll record{{action:'status', runId:{}}}) before starting another", active, active));
+					}
+					ActiveReplayClaim claimGuard{ runId };
 					const json        activity = plan.value("activity", json::object());
 					const std::string inputOwner = plan.value("inputOwner", std::string{});
+
+					// The run's hold on the game's speed — this is what makes a replay finish
+					// faster in wall time. Held for the whole run (including the async worker) and
+					// restored on any exit path; it also records every scale change issued while the
+					// run is open, so a checkpoint capture can declare itself incomparable.
+					float replayScale = static_cast<float>(TimeScaleControl::kNormalScale);
+					if (const auto scaleArg = a_args.find("timeScale"); scaleArg != a_args.end()) {
+						if (!scaleArg->is_number())
+							throw ToolError(400, std::format("replay: invalid timeScale '{}' (must be a number)", scaleArg->dump()));
+						const auto validation = TimeScaleControl::Validate(scaleArg->get<double>(), false,
+							BooleanArgument(a_args, "allowHigh", false));
+						if (!validation.accepted)
+							throw ToolError(400, std::format("replay: {}", validation.error));
+						// A frozen clock never advances the trajectory, so the run would never finish.
+						if (validation.value == static_cast<float>(TimeScaleControl::kFreezeScale))
+							throw ToolError(400, "replay: 'timeScale' cannot be 0 — a frozen clock never advances the trajectory");
+						replayScale = validation.value;
+					}
+					// Escalation to replayScale happens later, at setupStepCount; reject here too so a
+					// doomed run doesn't burn its setup steps first.
+					if (replayScale != static_cast<float>(TimeScaleControl::kNormalScale) &&
+						!BooleanArgument(a_args, "allowTimeScale", false)) {
+						// Same admission mutex TimeScaleControl::Set/Recording::start/Capture::Handle
+						// use, so this early check can't race a recording/capture start slipping in
+						// between the check and the RunHold constructed below.
+						std::lock_guard admissionLock(TimeScaleControl::AdmissionMutex());
+						if (Recording::IsActive())
+							throw ToolError(409, "replay: a recording is in progress — stop it first, or pass allowTimeScale:true to change the game's speed anyway");
+						if (Capture::InFlight())
+							throw ToolError(409, "replay: a capture is in flight — retry once it finishes, or pass allowTimeScale:true to change the game's speed anyway");
+					}
+					// Held at normal speed through setup/settle; escalated to replayScale at
+					// setupStepCount once the recorded trajectory starts (see BuildReplaySteps).
+					const bool        allowTimeScale = BooleanArgument(a_args, "allowTimeScale", false);
+					const std::size_t setupStepCount = plan.value("trajectoryStepCount", static_cast<std::size_t>(0));
+					const auto        scaleHold = std::make_shared<TimeScaleControl::RunHold>(
+						static_cast<float>(TimeScaleControl::kNormalScale), TimeScaleControl::kDefaultLeaseMs,
+						inputOwner.empty() ? std::format("replay:{}", runId) : inputOwner, allowTimeScale);
+
 					Recording::Notify(std::format("devbench: replaying {} steps (~{:.1f}s)", steps.size(), estMs / 1000.0));
 					logs::info("devbench: replay starting — {} steps, ~{}ms", steps.size(), estMs);
 					a_events.Publish("replay.started", json{ { "runId", runId }, { "steps", steps.size() },
@@ -2587,9 +2777,16 @@ namespace dvb
 					// copies. replay.finished must publish on EVERY exit -- a poller waiting on
 					// it would otherwise hang when a step throws.
 					const json coupling = plan.value("coupling", json::object());
-					auto       runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
-											   activity, inputOwner]() -> json {
-						const auto releaseRecordedInput = [&]() -> json {
+					const bool interpolate = Recording::WantsPoseDriver(a_args);
+					// Held from the trajectory boundary (not scene setup) to any exit; see ReplayHold.
+					const std::size_t trajectoryStepCount = plan.value("trajectoryStepCount", static_cast<std::size_t>(0));
+					const auto        cameraHold = std::make_shared<FreeCamera::ReplayHold>();
+					auto              runReplay = [&a_registry, &a_events, a_ctx, steps, runId, coupling,
+													  activity, inputOwner, interpolate, cameraHold,
+													  trajectoryStepCount, scaleHold, replayScale,
+													  setupStepCount, allowTimeScale]() -> json {
+						ActiveReplayClaim activeReplayGuard{ runId };
+						const auto        releaseRecordedInput = [&]() -> json {
 							if (inputOwner.empty())
 								return json{ { "needed", false } };
 							ToolContext inputCtx = a_ctx;
@@ -2631,7 +2828,23 @@ namespace dvb
 							const json initialCleanup = releaseRecordedInput();
 							if (!initialCleanup.value("ok", true))
 								throw ToolError(409, "recorded input cleanup is still pending; retry after controller/key restoration succeeds");
-							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId } }, a_ctx, a_registry, a_events);
+							bool cameraActivated = false;
+							bool scaleEscalated = false;
+							result = ScenarioHandler(json{ { "steps", steps }, { "runId", runId }, { "smoothPose", interpolate } },
+								a_ctx, a_registry, a_events,
+								[&cameraActivated, cameraHold, trajectoryStepCount, &scaleEscalated,
+									scaleHold, replayScale, setupStepCount, allowTimeScale](std::size_t a_index) {
+									if (!cameraActivated && a_index == trajectoryStepCount) {
+										cameraActivated = true;
+										// No-op off VR; on VR, a failure here must abort the replay.
+										cameraHold->Activate();
+									}
+									if (!scaleEscalated && a_index == setupStepCount &&
+										replayScale != static_cast<float>(TimeScaleControl::kNormalScale)) {
+										scaleEscalated = true;
+										scaleHold->Escalate(replayScale, TimeScaleControl::kDefaultLeaseMs, allowTimeScale);
+									}
+								});
 						} catch (const std::exception& e) {
 							const json cleanup = releaseRecordedInput();
 							a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false }, { "error", e.what() } });
@@ -2647,6 +2860,10 @@ namespace dvb
 						result["coupling"] = coupling;  // surface effective tier / override
 						result["activity"] = activity;
 						result["checkpoints"] = SummarizeCheckpoints(result);
+						// A run that did not play out entirely at normal speed is not comparable to
+						// a golden, so say so (and why) instead of leaving the verdict ambiguous.
+						result["goldensEligible"] = scaleHold->Eligible();
+						result["timeScaleChanges"] = scaleHold->Changes();
 						logs::info("devbench: replay finished — {} steps, ok={}",
 							result.value("stepsRun", 0), result.value("ok", false));
 						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", result.value("ok", false) }, { "stepsRun", result.value("stepsRun", 0) } });
@@ -2665,6 +2882,7 @@ namespace dvb
 								RunRegistry::Get().Fail(runId, e.what());
 							}
 						}).detach();
+						claimGuard.armed = false;
 					} catch (const std::exception& e) {
 						RunRegistry::Get().Fail(runId, e.what());
 						a_events.Publish("replay.finished", json{ { "runId", runId }, { "ok", false },

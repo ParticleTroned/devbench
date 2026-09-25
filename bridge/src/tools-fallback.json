@@ -2,7 +2,7 @@
   "tools": [
     {
       "name": "input",
-      "description": "Versioned synthetic input interface. action='capabilities' (default) returns the exact contract/version, readiness, limits, injection path, supported actions, and complete keyboard name→DirectInput-scan-code catalog; clients MUST capability-negotiate rather than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' reports readiness and every synthetic held key with owner/lease timing. 'down' starts a bounded owned hold (default maxHoldMs 5000; automatic up on expiry); repeated down by the same owner is idempotent and another owner gets 409. 'up' releases that owner's key; cross-owner force is reserved for internal cleanup. Releasing an unheld key is an idempotent no-op. 'tap' emits down, waits durationMs (default 50), then up. 'sequence' executes a prevalidated balanced array of tap/down/up/wait events (optional afterMs); it rejects an unbalanced hold before injecting anything and releases keys acquired by the sequence on failure. 'releaseAll' releases this owner only; all-owner cleanup is internal-only. Every lease watchdog retries a failed automatic release until it succeeds or becomes obsolete. owner defaults to the MCP session id or rest:anonymous; automation should supply a stable task owner. DevBench also releases owned keys on load/new-game and emits input.keyboard events for accepted down/up transitions. Contract v2 also implements device='vrTrackedSet': read-only observe returns the current physical OpenVR HMD and both controllers; one prevalidated timestamped sequence whose every frame atomically contains HMD, left-controller, and right-controller pose plus both controllers' complete OpenVR button/touch/axis state. It is applied at the OpenVR compositor/system boundary, is always asynchronous, has one owner, passes the real runtime through when inactive, and returns a controlToken required for external stop. Failed controller-index restoration remains retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot come from different clocks.",
+      "description": "Versioned synthetic input interface. action='capabilities' (default) returns the exact contract/version, readiness, limits, injection path, supported actions, and complete keyboard name→DirectInput-scan-code catalog; clients MUST capability-negotiate rather than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' reports readiness and every synthetic held key with owner/lease timing. 'down' starts a bounded owned hold (default maxHoldMs 5000; automatic up on expiry); repeated down by the same owner is idempotent and another owner gets 409. 'up' releases that owner's key; cross-owner force is reserved for internal cleanup. Releasing an unheld key is an idempotent no-op. 'tap' emits down, waits durationMs (default 50), then up. 'sequence' executes a prevalidated balanced array of tap/down/up/wait events (optional afterMs); it rejects an unbalanced hold before injecting anything and releases keys acquired by the sequence on failure. 'releaseAll' releases this owner only; all-owner cleanup is internal-only. Pending releases retain their leases until completion. 'up' returns pending=true and released=false, and 'releaseAll' lists those keys in pending rather than released. Every lease watchdog retries a failed automatic release until it succeeds or becomes obsolete. owner defaults to the MCP session id or rest:anonymous; automation should supply a stable task owner. DevBench also releases owned keys on load/new-game and emits input.keyboard events for accepted down/up transitions. Contract v2 also implements device='vrTrackedSet': read-only observe returns the current physical OpenVR HMD and both controllers; one prevalidated timestamped sequence whose every frame atomically contains HMD, left-controller, and right-controller pose plus both controllers' complete OpenVR button/touch/axis state. It is applied at the OpenVR compositor/system boundary, is always asynchronous, has one owner, passes the real runtime through when inactive, and returns a controlToken required for external stop. Failed controller-index restoration remains retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot come from different clocks.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -123,7 +123,7 @@
     },
     {
       "name": "console",
-      "description": "Run a Skyrim console command. action='exec' (default) queues `command` onto the main thread (runs next tick). With capture=true it is fenced between marker commands; a later action='read' slices ConsoleLog's buffer between the markers and returns the command's output as { markersFound, lines:[…] }. Useful for printing commands (getav, getgs, getpos, help). Read promptly after exec — heavy ConsoleLog spam can scroll the markers out of the buffer (then markersFound=false, no wrong data). `save <name>`/`load <name>` are rerouted to the `game` tool's BGSSaveLoadManager path and return { redirected:'game' } — running them as raw console commands deadlocks the engine (SkyrimVM::Freeze vs blocked main loop).",
+      "description": "Run a Skyrim console command. action='exec' (default) queues `command` onto the main thread (runs next tick). With capture=true it is fenced between marker commands and exec returns once the output has landed, so a following action='read' returns the command's output as { markersFound, lines:[...], source, lossPossible }. source='buffer' is complete, including several lines printed in one frame (e.g. `help`). source='sampler' is used once the Console menu has been created, when the game stops filling that buffer: it sees one line per frame, so a command that prints SEVERAL lines in a frame keeps only the last (lossPossible=true); getav, getgs and getpos are exact. A second capture while one is running gets 409. exec then returns { queued:false, completed }, completed=false meaning the end marker never arrived and `lines` may be incomplete; a capture that never sees its begin marker gets 504 and the command is not run. `save <name>`/`load <name>` are rerouted to the `game` tool's save/load path and return { redirected:'game' } — saves use SKSE's queued request to avoid synchronous save deadlocks (SkyrimVM::Freeze vs blocked main loop).",
       "inputSchema": {
         "properties": {
           "action": {
@@ -237,13 +237,29 @@
     },
     {
       "name": "game",
-      "description": "Save/load and list saves. action='list' returns { count, returned, truncated, saves: [{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps only names containing a substring (case-insensitive; save names embed the location, e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' object per matched save (characterName, location, race, level, experience, playTime, saveNumber, saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from the save's own .ess header, same bytes the vanilla Load menu shows, so it works even before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; 'loadLast' loads the most recent save (a settled real-game state — avoids coc's heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be negative) jumps the calendar directly — no need to fall back to console 'set timescale to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } read back the same tick; runs synchronously on the main thread.",
+      "description": "Save/load and list saves. action='list' returns { count, returned, truncated, saves: [{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps only names containing a substring (case-insensitive; save names embed the location, e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' object per matched save (characterName, location, race, level, experience, playTime, saveNumber, saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from the save's own .ess header, same bytes the vanilla Load menu shows, so it works even before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; 'loadLast' loads the most recent save (a settled real-game state — avoids coc's heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be negative) jumps the calendar directly — no need to fall back to console 'set timescale to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param 'scale', or 'freeze':true for 0) speeds up or slows down the game itself for 'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and it returns { requested, effective, applied, owner, leaseRemainingMs } only once the engine is actually running at the requested scale (the reconciler applies it on the next frame and the engine then ramps). It is refused (409) while a recording or a capture is in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without changing anything.",
       "inputSchema": {
         "properties": {
           "action": {
-            "description": "list | save | load | loadLast | advanceTime",
-            "enum": ["list", "save", "load", "loadLast", "advanceTime"],
+            "description": "list | save | load | loadLast | advanceTime | getTimeScale | setTimeScale",
+            "enum": [
+              "list",
+              "save",
+              "load",
+              "loadLast",
+              "advanceTime",
+              "getTimeScale",
+              "setTimeScale"
+            ],
             "type": "string"
+          },
+          "allowHigh": {
+            "description": "setTimeScale: permit a scale above 3.0, up to 10.0",
+            "type": "boolean"
+          },
+          "allowTimeScale": {
+            "description": "setTimeScale: change the scale even while a recording or capture is in flight (default false)",
+            "type": "boolean"
           },
           "detail": {
             "description": "list only: add per-save character/location/level metadata (default false)",
@@ -257,6 +273,14 @@
             "description": "list only: case-insensitive substring to match against save names",
             "type": "string"
           },
+          "freeze": {
+            "description": "setTimeScale: confirm scale 0 (freeze); required with a 0 scale",
+            "type": "boolean"
+          },
+          "holdMs": {
+            "description": "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)",
+            "type": "integer"
+          },
           "hours": {
             "description": "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)",
             "type": "number"
@@ -268,6 +292,10 @@
           "name": {
             "description": "save file name (required for save/load; from action='list')",
             "type": "string"
+          },
+          "scale": {
+            "description": "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)",
+            "type": "number"
           }
         },
         "type": "object"
@@ -275,7 +303,7 @@
     },
     {
       "name": "camera",
-      "description": "Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned } read live on the main thread, where pov is first | third | vanity | other. stateId is the runtime-specific CameraState value; interpret it with freeCamBackend. action='setPov' applies a switch (param 'pov': first | third | vanity) on the main thread and returns { pov: <applied>, requestedPov } read back the same tick — Skyrim's idle-vanity timer can still override it a few ticks later while the player is stationary, so poll action='get' if you need certainty after idling. action='freecam' (param 'on', default true) enables or disables free camera. On VR, freeCamBackend='vr-state': activation and restoration complete before return (queued=false), using the existing VR state without changing freeze time. On SE/AE the native toggle is queued; poll action='get'.freeCam before 'drive'. action='drive' (params 'x','y','z','pitch','yaw', all default 0) sets the free camera's world transform — requires free-cam mode already on. VR pitch/yaw are native free-camera angles in radians; SE/AE writes them to FreeCameraState::rotation using the existing best-effort convention. VR enable, disable, and drive reject an active camera owned elsewhere; freeCamOwned reports devbench ownership. After failed pre-load restoration, freecam off retries recovery using the loaded scene's normal VR state; unavailable or rejected recovery returns HTTP 500. VR drive completes its field writes before return; allow a rendered frame before capture. Recordings capture the POV per sample and replay restores it via this tool, since what is rendered (and benchmarked) differs by POV.",
+      "description": "Read or set the player camera. action='get' (default) returns { pov, freeCam, camX, camY, camZ, camPitch, camYaw, stateId, freeCamBackend, freeCamOwned } read live on the main thread, where pov is first | third | vanity | other. stateId is the runtime-specific CameraState value; interpret it with freeCamBackend. action='setPov' applies a switch (param 'pov': first | third | vanity) on the main thread and returns { pov: <applied>, requestedPov } read back the same tick — Skyrim's idle-vanity timer can still override it a few ticks later while the player is stationary, so poll action='get' if you need certainty after idling. action='freecam' (param 'on', default true) enables or disables free camera on either runtime: activation and restoration complete before return (queued=false) and read back the same tick, without changing freeze time. freeCamBackend reports which mechanism is in play: VR ('vr-state') hand-drives the transition, since the engine's own toggle never installs free-cam as the current state on VR 1.4.15; flat ('engine') uses the engine's own toggle, which enters and restores correctly there. action='drive' (params 'x','y','z','pitch','yaw', all default 0) sets the free camera's world transform — requires free-cam mode already on. pitch/yaw are native free-camera angles in radians on both runtimes, writing FreeCameraState::rotation directly; completes its field writes before return, so allow a rendered frame before capture. enable, disable, and drive all reject an active free camera owned elsewhere; freeCamOwned reports devbench's own ownership. On VR, after failed pre-load restoration, freecam off retries recovery using the loaded scene's normal VR state; unavailable or rejected recovery returns HTTP 500. Recordings capture the POV per sample and replay restores it via this tool, since what is rendered (and benchmarked) differs by POV. A recording also captures the camera's own world transform per sample, on whichever runtime recorded it; record{action:'replay'} drives it exactly via this tool's freecam+drive instead of setPov, since head-look is a degree of freedom setpos+setPov can't reproduce, on either runtime. Devbench's own replay always owns and releases the free camera itself for that duration.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -288,7 +316,7 @@
             "type": "boolean"
           },
           "pitch": {
-            "description": "drive: VR native free-cam pitch in radians; SE/AE best-effort FreeCameraState::rotation.x",
+            "description": "drive: native free-cam pitch in radians (FreeCameraState::rotation.x)",
             "type": "number"
           },
           "pov": {
@@ -305,7 +333,7 @@
             "type": "number"
           },
           "yaw": {
-            "description": "drive: VR native free-cam yaw in radians; SE/AE best-effort FreeCameraState::rotation.y",
+            "description": "drive: native free-cam yaw in radians (FreeCameraState::rotation.y)",
             "type": "number"
           },
           "z": {
@@ -364,6 +392,10 @@
         "properties": {
           "allowNative": {
             "description": "permit kind=auto to fall back to the vanilla path when no provider is registered (default false)",
+            "type": "boolean"
+          },
+          "allowTimeScale": {
+            "description": "capture anyway while the game's time scale is not 1 (default false; a scaled frame is not comparable to a golden taken at normal speed)",
             "type": "boolean"
           },
           "checkpointId": {
@@ -426,7 +458,7 @@
     },
     {
       "name": "record",
-      "description": "Capture a manual play-through as a versioned activity trace and replayable scenario. action='start' begins sampling the player pose (x/y/z/angleZ/angleX + camera pos + POV + game frame + VR HMD/left-wand/right-wand world transforms) every intervalMs (default from config recordIntervalMs, range 10..1800000) on a background thread while the Skyrim BSInputDeviceManager sink records every normalized keyboard, mouse, gamepad, and VR-controller event plus menu and lifecycle transitions on the same monotonic clock. The activity contract and exact replay support are returned by start and stored in meta.activityCapture; activityEvents preserves unsupported events rather than approximating them. The sampling thread also captures a one-time scene manifest (worldspace/cell, time of day, weather, anchor pose, and the entryPoint — the save loaded or coc'd to reach the scene, or 'unknown'). Normally a game must be loaded; allowNoPlayer=true explicitly permits capture from the main menu/new-game flow and stores the first subsequently loaded player scene separately. 'checkpoint' marks THIS moment (while recording is active) as a screenshot checkpoint — requires 'id' (unique this recording); optional excludeUi (default true). Mirrors 'stop' capturing the trajectory: no manual JSON editing needed. Carries no golden/threshold — those are supplied later, per-checkpoint, on replay's 'goldens' arg, since a golden reference doesn't exist yet at mark-time. 'stop' writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json and returns its path + meta (meta.checkpoints holds any marked via 'checkpoint'). Supply expectedCorrelationId to stop only the matching recording: comparison and transition are atomic, and a mismatch returns 409 without stopping or finalizing the capture. Observation capture has a configurable maximumDurationMs (10..14400000, default four hours), independent of the unchanged 30-minute replay limit. The retained pose and combined tracking/activity budgets remain 60000 each; use a suitable intervalMs for long observations. At either limit, status becomes limited, recording=false, and a HUD/log warning asks for stop to persist. status reports remaining time/capacity, actual recordedMs and lastSampleMs; status, stop and metadata also report elapsedMs and unrecordedTailMs without counting a delayed finalization as capture. The first stop request freezes both clocks, including across persistence retries. Recordings longer than 30 minutes are observation evidence and cannot be replayed. Replay step waits must be nonnegative integers; the combined atMs/wait clock is also capped at 30 minutes. Generated VR input frames, including their 50 ms tail, must fit within the same replay limit. 'replay' runs a recording file ('path'): with restoreScene=true it re-establishes the entryPoint and waits for the player before the trajectory, so the run reproduces the recorded scene (interiors coc the cell; exterior entries use cow with the recorded worldspace + anchor grid cell — exterior editor ids are not unique and a raw exterior coc can wedge the engine); otherwise it teleports along the path in the current scene. Emits record.started / record.stopped and replay.started / replay.finished markers, plus scenario.step progress events. The recipe's coupling tier (meta.coupling) is the producer's signal for how tightly the start must be reproduced; a consumer can override it — 'coupling' forces a looser tier ('worldspace' skips the restore) and 'force' turns a scene mismatch from an abort into a reported warning, to run a recipe generally accepting it may not reproduce. replay is ASYNC BY DEFAULT — mirroring game{action:'load'} — and returns {queued:true, runId, steps, estMs} immediately; poll completion via record{action:'status', runId} (returns {done, ok, result} once finished, {done:false} while running) or watch replay.started / replay.finished on GET /api/events (both carry runId; the runId space is shared with scenario, so a replay's runId also resolves via scenario{action:'status'}). Pass async:false to block the request for the run's duration and get the result object directly. On VR, OpenVR HMD/controller poses and complete controller packet/button/touch/axis state are sampled even before a player exists. replayInputs=true (default) starts one atomic HMD+left+right tracked-set sequence and interleaves keyboard transitions on the same recording clock. Legacy recording-3 files without exact controller packets are upgraded from their wand-indexed normalized events using previous-pose hold; the replay report identifies fallback or unsupported events. Mouse/gamepad/menu/lifecycle events remain observational and explicitly reported rather than silently approximated. Set replayInputs=false for pose-only behavior. If the recording has meta.checkpoints, each expands into a `capture` step at the point in the trajectory its atMs was recorded, tagged with 'variant' for correlation (default 'default') — see the `capture` tool. Pass captureCheckpoints:false to replay the same recording as a plain trajectory-only run instead — checkpoints are skipped entirely (no capture provider required, nothing captured), so one recording can serve as both a general tour and a visual-review run depending on the call. Pass 'goldens' to also get an inline SSIM verdict per checkpoint: {\"<checkpointId>\": {golden, threshold?, regions?}}; a checkpoint with no matching entry is captured but not scored. The result's top-level 'checkpoints' array rolls up every capture step into {id, ok, path, inconclusive, inconclusiveReason?, ssim?, threshold?, passed?} — read this instead of filtering the (often much larger) 'results' step transcript yourself.",
+      "description": "Capture a manual play-through as a versioned activity trace and replayable scenario. action='start' begins sampling the player pose (x/y/z/angleZ/angleX + camera pos + POV + game frame + VR HMD/left-wand/right-wand world transforms) every intervalMs (default from config recordIntervalMs, range 10..1800000) on a background thread while the Skyrim BSInputDeviceManager sink records every normalized keyboard, mouse, gamepad, and VR-controller event plus menu and lifecycle transitions on the same monotonic clock. The activity contract and exact replay support are returned by start and stored in meta.activityCapture; activityEvents preserves unsupported events rather than approximating them. The sampling thread also captures a one-time scene manifest (worldspace/cell, time of day, weather, anchor pose, and the entryPoint — the save loaded or coc'd to reach the scene, or 'unknown'). Normally a game must be loaded; allowNoPlayer=true explicitly permits capture from the main menu/new-game flow and stores the first subsequently loaded player scene separately. 'checkpoint' marks THIS moment (while recording is active) as a screenshot checkpoint — requires 'id' (unique this recording); optional excludeUi (default true). Mirrors 'stop' capturing the trajectory: no manual JSON editing needed. Carries no golden/threshold — those are supplied later, per-checkpoint, on replay's 'goldens' arg, since a golden reference doesn't exist yet at mark-time. 'stop' writes the trajectory to Data/SKSE/Plugins/devbench/recordings/recording_<stamp>.json and returns its path + meta (meta.checkpoints holds any marked via 'checkpoint'). Supply expectedCorrelationId to stop only the matching recording: comparison and transition are atomic, and a mismatch returns 409 without stopping or finalizing the capture. Observation capture has a configurable maximumDurationMs (10..14400000, default four hours), independent of the unchanged 30-minute replay limit. The retained pose and combined tracking/activity budgets remain 60000 each; use a suitable intervalMs for long observations. At either limit, status becomes limited, recording=false, and a HUD/log warning asks for stop to persist. status reports remaining time/capacity, actual recordedMs and lastSampleMs; status, stop and metadata also report elapsedMs and unrecordedTailMs without counting a delayed finalization as capture. The first stop request freezes both clocks, including across persistence retries. Recordings longer than 30 minutes are observation evidence and cannot be replayed. Replay step waits must be nonnegative integers; the combined atMs/wait clock is also capped at 30 minutes. Generated VR input frames, including their 50 ms tail, must fit within the same replay limit. 'replay' runs a recording file ('path'): with restoreScene=true it re-establishes the entryPoint and waits for the player before the trajectory, so the run reproduces the recorded scene (interiors coc the cell; exterior entries use cow with the recorded worldspace + anchor grid cell — exterior editor ids are not unique and a raw exterior coc can wedge the engine); otherwise it teleports along the path in the current scene. Emits record.started / record.stopped and replay.started / replay.finished markers, plus scenario.step progress events. The recipe's coupling tier (meta.coupling) is the producer's signal for how tightly the start must be reproduced; a consumer can override it — 'coupling' forces a looser tier ('worldspace' skips the restore) and 'force' turns a scene mismatch from an abort into a reported warning, to run a recipe generally accepting it may not reproduce. replay is ASYNC BY DEFAULT — mirroring game{action:'load'} — and returns {queued:true, runId, steps, estMs} immediately; poll completion via record{action:'status', runId} (returns {done, ok, result} once finished, {done:false} while running) or watch replay.started / replay.finished on GET /api/events (both carry runId; the runId space is shared with scenario, so a replay's runId also resolves via scenario{action:'status'}). Pass async:false to block the request for the run's duration and get the result object directly. On VR, OpenVR HMD/controller poses and complete controller packet/button/touch/axis state are sampled even before a player exists. replayInputs=true (default) starts one atomic HMD+left+right tracked-set sequence and interleaves keyboard transitions on the same recording clock. Legacy recording-3 files without exact controller packets are upgraded from their wand-indexed normalized events using previous-pose hold; the replay report identifies fallback or unsupported events. Mouse/gamepad/menu/lifecycle events remain observational and explicitly reported rather than silently approximated. Set replayInputs=false for pose-only behavior. If the recording has meta.checkpoints, each expands into a `capture` step at the point in the trajectory its atMs was recorded, tagged with 'variant' for correlation (default 'default') — see the `capture` tool. Pass captureCheckpoints:false to replay the same recording as a plain trajectory-only run instead — checkpoints are skipped entirely (no capture provider required, nothing captured), so one recording can serve as both a general tour and a visual-review run depending on the call. Pass 'goldens' to also get an inline SSIM verdict per checkpoint: {\"<checkpointId>\": {golden, threshold?, regions?}}; a checkpoint with no matching entry is captured but not scored. The result's top-level 'checkpoints' array rolls up every capture step into {id, ok, path, inconclusive, inconclusiveReason?, ssim?, threshold?, passed?} — read this instead of filtering the (often much larger) 'results' step transcript yourself. Only one replay runs at a time: starting another while one is in flight is refused with 409 naming the active runId. Pass 'timeScale' (0.1..3.0, up to 10.0 with 'allowHigh':true) to replay the whole run that many times faster — the trajectory is paced in GAME time, so the run keeps its shape and a mid-run change is absorbed; the setup/restore phase before the trajectory (coc/cow + settle) always runs at normal speed, since a load screen isn't sped up by this and its settle physics stay predictable; the scale is restored when the run ends, and the result reports goldensEligible plus timeScaleChanges[] (a scaled run is not comparable to a golden, which is reported rather than refused). 'start' is refused (409) while the game is running at a scale other than 1, and both 'start' and 'replay' can override that with allowTimeScale:true.",
       "inputSchema": {
         "properties": {
           "action": {
@@ -434,8 +466,12 @@
             "enum": ["start", "stop", "status", "replay", "checkpoint"],
             "type": "string"
           },
-          "allowNoPlayer": {
-            "description": "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)",
+          "allowHigh": {
+            "description": "replay: permit a timeScale above 3.0, up to 10.0",
+            "type": "boolean"
+          },
+          "allowTimeScale": {
+            "description": "start/replay: proceed while the game's time scale is not 1 (start would record an incomparable run; default false)",
             "type": "boolean"
           },
           "async": {
@@ -447,7 +483,7 @@
             "type": "boolean"
           },
           "closeMenus": {
-            "description": "replay: if a MODAL is open at start, cancel it and continue instead of erroring; non-modal gameplay menus still error (default false)",
+            "description": "replay: cancel an open MODAL (e.g. the Survival Mode prompt a scene transition can raise) instead of erroring, both at start and at the post-restore menu guard; non-modal gameplay menus still error (default false)",
             "type": "boolean"
           },
           "correlationId": {
@@ -482,6 +518,10 @@
             "description": "checkpoint: unique id for this checkpoint (required)",
             "type": "string"
           },
+          "interpolate": {
+            "description": "replay: drive the player along the recorded path once per engine frame with interpolated position/yaw/pitch on an absolute clock, instead of one teleport per sample. Result carries poseDriver stats; false keeps per-sample teleports (default true)",
+            "type": "boolean"
+          },
           "intervalMs": {
             "description": "start: player-pose and raw-VR-tracking sample period in ms (default = config recordIntervalMs)",
             "maximum": 1800000,
@@ -510,9 +550,17 @@
             "description": "status: poll an async replay run started earlier (from replay's 'runId')",
             "type": "integer"
           },
+          "timeScale": {
+            "description": "replay: run the recorded trajectory this many times faster (0.1..3.0, up to 10.0 with allowHigh:true) and restore the previous scale when it ends — the setup/restore phase runs at normal speed regardless. The result reports goldensEligible plus timeScaleChanges[]",
+            "type": "number"
+          },
           "variant": {
             "description": "replay: tag for any meta.checkpoints captures, for correlation (default 'default')",
             "type": "string"
+          },
+          "allowNoPlayer": {
+            "description": "start: permit a main-menu/new-game recording before a PlayerCharacter is loaded (default false)",
+            "type": "boolean"
           }
         },
         "type": "object"

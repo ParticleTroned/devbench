@@ -16,9 +16,9 @@ if (!baseRef) {
 
 const REGISTRATION_FILES = [
   "src/Tools.cpp",
-  "src/KeyboardInput.cpp",
   "src/Capture.cpp",
   "src/HostApi.cpp",
+  "src/KeyboardInput.cpp",
   "src/ToolRegistry.h",
 ];
 const FALLBACK_FILE = "bridge/src/tools-fallback.json";

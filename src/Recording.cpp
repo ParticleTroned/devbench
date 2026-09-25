@@ -2,10 +2,13 @@
 
 #include "GameEvents.h"
 #include "GameState.h"
+#include "InputHotkeys.h"
 #include "MainThread.h"
 #include "RecordingActivity.h"
 #include "RecordingManifest.h"
 #include "RecordingWindow.h"
+#include "ReplayTrajectory.h"
+#include "TimeScaleControl.h"
 #include "ToolExtensions.h"
 #include "ToolRegistry.h"
 #include "VRInputState.h"
@@ -71,6 +74,18 @@ namespace dvb::Recording
 		// hook — already carry the trajectory, so re-sampling would double it. Lets a user record
 		// a session that plays back an existing recipe and embed it cleanly (composition).
 		std::atomic<bool> g_replaying{ false };
+
+		std::vector<int> ReservedInputKeys()
+		{
+			int  recordKey = 0, replayKey = 0;
+			bool recordShift = false, replayShift = false;
+			GetHotkeys(recordKey, recordShift, replayKey, replayShift);
+			std::vector<int> keys;
+			for (const int key : { recordKey, replayKey })
+				if (key > 0)
+					keys.push_back(key);
+			return keys;
+		}
 
 		// Set when a coc/cow console command is captured mid-recording (the player COMMANDED a cell
 		// transition). The cell-load that follows consumes it so NoteCellChange doesn't ALSO emit a
@@ -438,7 +453,7 @@ namespace dvb::Recording
 			std::uint64_t            nextActivitySeq = 1;
 			bool                     limitReached = false;
 			std::string              limitReason;
-			json                     manifest;
+			json                     manifest = json::object();
 			long                     intervalMs = kDefaultIntervalMs;
 			steady_clock::time_point startTick;
 			RecordingWindow          window;
@@ -616,8 +631,7 @@ namespace dvb::Recording
 
 		// Build a replayable scenario: teleport the player to each sample (per-axis setpos +
 		// setangle in degrees) with a wait of intervalMs between, so the captured path doubles
-		// as the measure window. Player-teleport replay needs no new engine hooks; smooth
-		// interpolation and a free-camera path are later enhancements.
+		// as the measure window. On VR, the camera is driven separately (see ReplayDriver).
 		json BuildScenario(const Recorder& a_rec, long a_recordedMs)
 		{
 			const auto consoleStep = [](const std::string& a_cmd, long a_atMs) {
@@ -632,11 +646,14 @@ namespace dvb::Recording
 					step["atMs"] = a_atMs;
 				return step;
 			};
-
+			// The VR camera is driven live at replay time (see ReplayDriver::State::DriveCamera),
+			// not from a discrete per-sample step here.
 			json                  steps = json::array();
 			std::string           lastPov;     // emit a camera step only when the POV changes
 			std::array<double, 5> lastPose{};  // previous emitted pose (round-2); a repeat → bare wait
 			bool                  havePose = false;
+			std::array<double, 5> lastCamPose{};  // previous emitted camera pose (round-4)
+			bool                  haveCamPose = false;
 			size_t                cmdIdx = 0;    // drain console commands captured up to each sample's frame
 			long                  prevTMs = -1;  // previous sample's wall-clock offset for delta waits
 			for (const auto& s : a_rec.samples) {
@@ -663,14 +680,30 @@ namespace dvb::Recording
 					r2(s.value("angleZ", 0.0) * kRadToDeg),
 					r2(s.value("angleX", 0.0) * kRadToDeg),  // pitch
 				};
+				// Tracked independently of pose so a head-turn-only sample still gets a row.
+				bool                        haveThisCam = s.contains("camX") && s.contains("camPitch");
+				const auto                  roundToFourDecimals = [](double v) { return std::round(v * 10000.0) / 10000.0; };
+				const std::array<double, 5> camPose{
+					roundToFourDecimals(s.value("camX", 0.0)),
+					roundToFourDecimals(s.value("camY", 0.0)),
+					roundToFourDecimals(s.value("camZ", 0.0)),
+					roundToFourDecimals(s.value("camPitch", 0.0)),
+					roundToFourDecimals(s.value("camYaw", 0.0)),
+				};
+				const bool camChanged = haveThisCam && (!haveCamPose || camPose != lastCamPose);
 				const long waitMs = (tMs > 0 && prevTMs >= 0) ? std::max(1L, tMs - prevTMs) : a_rec.intervalMs;
 				json       row{ { "wait", waitMs } };
 				if (tMs >= 0)
 					row["atMs"] = tMs;
-				if (!havePose || pose != lastPose) {
+				if (!havePose || pose != lastPose || camChanged) {
 					row["pose"] = pose;
 					lastPose = pose;
 					havePose = true;
+				}
+				if (camChanged) {
+					row["camPose"] = camPose;
+					lastCamPose = camPose;
+					haveCamPose = true;
 				}
 				steps.push_back(std::move(row));
 				prevTMs = tMs;
@@ -708,7 +741,9 @@ namespace dvb::Recording
 				{ "camera", json::array({ "worldPosition", "worldPitch", "worldYaw", "pov" }) },
 				{ "vrTrackedNodes", json::array({ "hmd", "leftWand", "rightWand" }) },
 				{ "transformEncoding", "[tx,ty,tz,r00,r01,r02,r10,r11,r12,r20,r21,r22,scale]" },
-				{ "vrTransformReplay", false },
+				// Informational only; replay no longer branches on this.
+				{ "vrTransformReplay", std::any_of(a_rec.samples.begin(), a_rec.samples.end(),
+										   [](const json& s) { return s.contains("camX") && s.contains("camPitch"); }) },
 			};
 			meta["activityCounts"] = SummarizeActivity(a_rec.activityEvents);
 			meta["trackingSampleCount"] = a_rec.trackingSamples.size();
@@ -814,10 +849,21 @@ namespace dvb::Recording
 
 		if (action == "start") {
 			{
+				// Admission check + the idle->starting commit happen atomically with respect to
+				// TimeScaleControl::Set's own check (same mutex), so a concurrent setTimeScale can't
+				// slip a non-normal scale past this check, or vice versa.
+				std::lock_guard admissionLock(TimeScaleControl::AdmissionMutex());
 				std::lock_guard lock(rec.mtx);
 				if (rec.state != RecorderState::idle)
 					return json{ { "error", "recorder is not idle — stop or wait for the current operation" },
 						{ "state", RecorderStateName(rec.state) } };
+				// A capture taken at a non-normal game speed is not comparable to one taken at 1x, so
+				// refuse to start rather than record a run that cannot be benchmarked against.
+				const float scale = TimeScaleControl::Effective();
+				if (!a_args.value("allowTimeScale", false) &&
+					std::fabs(scale - static_cast<float>(TimeScaleControl::kNormalScale)) > TimeScaleControl::kEffectiveTolerance)
+					return json{ { "error", std::format("the game is running at time scale {} — restore scale 1 (game setTimeScale) before recording, or pass allowTimeScale:true", scale) },
+						{ "errorCode", 409 } };
 				rec.state = RecorderState::starting;
 			}
 			const auto cancelStart = [&rec]() {
@@ -990,6 +1036,11 @@ namespace dvb::Recording
 			json       scenario;
 			fs::path   path;
 			try {
+				{
+					std::lock_guard lock(rec.mtx);
+					const json      collapsedActivity = CollapseConsoleTyping(json(rec.activityEvents));
+					rec.activityEvents.assign(collapsedActivity.begin(), collapsedActivity.end());
+				}
 				scenario = BuildScenario(rec, recordedMs);
 				path = WriteScenarioFile(scenario);
 			} catch (const std::exception& e) {
@@ -1066,6 +1117,16 @@ namespace dvb::Recording
 		}
 
 		return json{ { "error", "unknown action (start|stop|status|checkpoint)" }, { "action", action } };
+	}
+
+	bool IsActive()
+	{
+		// Includes the "starting"/"stopping" transitional states, not just "running" — a
+		// concurrent setTimeScale must see a recording as active from the moment it reserves
+		// idle, not just once its worker thread is up (see TimeScaleControl::Set).
+		auto&           rec = Get();
+		std::lock_guard lock(rec.mtx);
+		return rec.state != RecorderState::idle;
 	}
 
 	void Notify(const std::string& a_msg)
@@ -1157,8 +1218,12 @@ namespace dvb::Recording
 		if (!a_events || !generation ||
 			g_replaying.load(std::memory_order_relaxed))
 			return;
-		for (const auto* event = *a_events; event; event = event->next)
-			AppendActivity(SerializeInputEvent(*event), generation);
+		const std::vector<int> reservedKeys = ReservedInputKeys();
+		for (const auto* event = *a_events; event; event = event->next) {
+			json serialized = SerializeInputEvent(*event);
+			if (!IsKeyEventFor(serialized, reservedKeys))
+				AppendActivity(std::move(serialized), generation);
+		}
 	}
 
 	void NoteMenuState(const std::string& a_menuName, bool a_opening)
@@ -1254,7 +1319,7 @@ namespace dvb::Recording
 			// afterward. The reverse order made the wait pointless -- assert fired on whatever
 			// was open at this exact instant, before the wait ever got a chance to run.
 			a_steps.push_back(json{ { "waitUntil", "noBlockingMenu" }, { "timeoutMs", 5000 }, { "pollMs", 100 } });
-			a_steps.push_back(json{ { "assert", "noBlockingMenu" } });
+			a_steps.push_back(json{ { "assert", "noBlockingMenu" }, { "closeModals", a_args.value("closeMenus", false) } });
 			if (a_cp.contains("pov"))
 				a_steps.push_back(json{ { "tool", "camera" }, { "args", json{ { "action", "setPov" }, { "pov", a_cp["pov"] } } } });
 			if (const long settleMs = a_cp.value("settleMs", a_defaultSettleMs); settleMs > 0)
@@ -1279,6 +1344,12 @@ namespace dvb::Recording
 				{ "atMs", a_cp.value("atMs", 0LL) },
 				{ "resolvedAtMs", a_cumMs },
 				{ "resolvedIndex", static_cast<long>(a_steps.size()) },
+				// Inherits the replay's own consent: a scaled replay already reports
+				// goldensEligible:false, so a checkpoint capture during it must not 409 too —
+				// requesting timeScale at all is the consent, not just an explicit allowTimeScale.
+				{ "allowTimeScale", a_args.value("allowTimeScale", false) ||
+										(a_args.contains("timeScale") && a_args["timeScale"].is_number() &&
+											a_args["timeScale"].get<double>() != TimeScaleControl::kNormalScale) },
 			};
 			if (a_cp.contains("subrect"))
 				capArgs["subrect"] = a_cp["subrect"];
@@ -1302,6 +1373,11 @@ namespace dvb::Recording
 			}
 			a_steps.push_back(json{ { "tool", "capture" }, { "args", std::move(capArgs) } });
 		}
+	}
+
+	bool WantsPoseDriver(const json& a_args)
+	{
+		return a_args.value("interpolate", true);
 	}
 
 	json BuildReplaySteps(const json& a_args)
@@ -1351,7 +1427,13 @@ namespace dvb::Recording
 		json steps = json::array();
 
 		try {
+			// Validate raw waits before interpolation can normalize invalid values.
 			ValidateRecordingReplayDuration(rec);
+			if (WantsPoseDriver(a_args)) {
+				rec["steps"] = ScaleWaitsToRecordedDuration(rec["steps"],
+					rec.value("meta", json::object()).value("recordedMs", static_cast<std::int64_t>(0)));
+				ValidateRecordingReplayDuration(rec);
+			}
 		} catch (const std::invalid_argument& e) {
 			throw ToolError(400, std::format("invalid recording duration (30-minute replay limit): {}", e.what()));
 		}
@@ -1531,7 +1613,7 @@ namespace dvb::Recording
 		// (without the in-game guard, such a replay silently no-ops).
 		const bool allowsInitialMenus = meta.value("startState", std::string{}) == "noPlayer";
 		if (!allowsInitialMenus)
-			steps.push_back(json{ { "assert", "noBlockingMenu" } });
+			steps.push_back(json{ { "assert", "noBlockingMenu" }, { "closeModals", a_args.value("closeMenus", false) } });
 
 		// Copy the trajectory, injecting a load-settle after any captured cell transition (coc/cow):
 		// the destination cell must finish loading before the following setpos teleports the player,
@@ -1555,7 +1637,8 @@ namespace dvb::Recording
 		json              vrPlan;
 		try {
 			activityPlan = InterleaveReplayableActivity(rec["steps"],
-				rec.value("activityEvents", json::array()), inputOwner, replayInputs);
+				rec.value("activityEvents", json::array()), inputOwner, replayInputs,
+				ReservedInputKeys());
 			vrPlan = BuildVRTrackedSetReplay(rec.value("trackingSamples", json::array()),
 				rec.value("activityEvents", json::array()), inputOwner, replayInputs);
 		} catch (const json::exception& e) {
@@ -1566,6 +1649,8 @@ namespace dvb::Recording
 		const json& trajectory = activityPlan["steps"];
 		long        cumMs = 0;
 		size_t      cpIdx = 0;
+		// Everything above is restore/settle; the replay camera hold only activates from here on.
+		const std::size_t trajectoryStepCount = steps.size();
 		if (!vrPlan.value("step", json(nullptr)).is_null())
 			steps.push_back(vrPlan["step"]);
 		for (const auto& s : trajectory) {
@@ -1608,6 +1693,7 @@ namespace dvb::Recording
 								std::string{} },
 			{ "restored", restored },  // handler's sync menu pre-check skips restore plans (the load clears menus)
 			{ "allowsInitialMenus", allowsInitialMenus },
+			{ "trajectoryStepCount", trajectoryStepCount },  // the replay camera hold activates from here on
 			{ "coupling", json{
 							  { "tier", tier },
 							  { "producer", producerTier },

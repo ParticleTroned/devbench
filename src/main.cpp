@@ -2,6 +2,7 @@
 #include "Capture.h"
 #include "Config.h"
 #include "ConsoleHook.h"
+#include "FreeCamera.h"
 #include "GameEvents.h"
 #include "GameState.h"
 #include "HostApi.h"
@@ -12,7 +13,6 @@
 #include "Server.h"
 #include "StallWatchdog.h"
 #include "Tools.h"
-#include "VRFreeCamera.h"
 #include "VRInput.h"
 #include "Version.h"
 
@@ -22,9 +22,10 @@
 
 namespace
 {
-	// Constructed at kDataLoaded with the configured port (null if disabled via config).
-	std::unique_ptr<dvb::Server> g_server;
-	dvb::Config                  g_config;  // captured at kPostLoad; used at kInputLoaded
+	// Process-lifetime: DLL detach runs after Windows terminates the server's workers,
+	// so destroying it there would wait for threads that can no longer finish.
+	dvb::Server* g_server = nullptr;
+	dvb::Config  g_config;  // captured at kPostLoad; used at kInputLoaded
 
 	void InitLogging()
 	{
@@ -66,9 +67,9 @@ namespace
 		if (!a_msg)
 			return;
 		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame)
-			dvb::VRFreeCamera::BeginLoad();
+			dvb::FreeCamera::BeginLoad();
 		else if (a_msg->type == SKSE::MessagingInterface::kNewGame || a_msg->type == SKSE::MessagingInterface::kPostLoadGame)
-			dvb::VRFreeCamera::EndLoad();
+			dvb::FreeCamera::EndLoad();
 		// Init at kPostLoad, not kDataLoaded: SKSE runs ALL plugins' kPostLoad before any
 		// kDataLoaded, so the cross-plugin interface is ready when consumer mods request it
 		// at their kDataLoaded (otherwise plugin order can make us answer too late — a
@@ -84,7 +85,7 @@ namespace
 				// registers its self-test tool) BEFORE Start() so they appear on both
 				// transports from the first request; then attach game-event sources.
 				g_config = cfg;  // kept for kInputLoaded (input sink registers later)
-				g_server = std::make_unique<dvb::Server>("127.0.0.1", cfg.port);
+				g_server = new dvb::Server("127.0.0.1", cfg.port);
 				g_server->Events().SetFrameProvider(&dvb::game::CurrentFrame);
 				dvb::RegisterCoreTools(g_server->Tools(), g_server->Events());
 				dvb::Recording::SetLoadSettleMs(cfg.loadSettleMs);
