@@ -123,6 +123,8 @@ to tag the merged commit and publish its binaries without pushing a version
 commit to `main`. The tagged build embeds that tag's fork version and release
 notes state the upstream base. The tracked upstream `.releaserc` is preserved;
 the fork selects its configuration only in the disposable CI checkout.
+Fork release comments and issue labels are disabled because merged upstream
+PR numbers belong to the upstream repository, not the fork.
 
 The existing fork release `v1.15.2` is also identified by `pt-v1.15.2` at the same
 commit, preserving the fork's version history without changing legacy tags.
