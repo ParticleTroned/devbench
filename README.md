@@ -130,12 +130,20 @@ The existing fork release `v1.15.2` is also identified by `pt-v1.15.2` at the sa
 commit, preserving the fork's version history without changing legacy tags.
 Upstream `v*` tags do not participate in the new fork release sequence.
 
-When synchronizing, fetch upstream and merge `upstream/main` into the fork's
-`main`; retain upstream's numeric version and the fork's independent release
-tags. Keep both histories rather than resetting to upstream. Newly merged
-feature and fix commits contribute to the next semantic fork release.
+All fork changes go through a feature branch and a pull request targeting
+`ParticleTroned/devbench:main`; do not push changes directly to `main`.
+When synchronizing, branch from the fork's `main`, fetch upstream, and merge
+`upstream/main` into the feature branch. Retain upstream's numeric version
+and the fork's independent release tags. Keep both histories rather than
+resetting to upstream, and merge the synchronization PR with a merge commit,
+not a squash. Newly merged feature and fix commits contribute to the next
+semantic fork release.
 Publish only to `origin` (`ParticleTroned/devbench`); `upstream` is fetch-only.
 Nexus publishing remains limited to the upstream repository.
+
+See [AGENTS.md](AGENTS.md) for contributor automation rules and the
+[DevBench 1.22.0 synchronization record](docs/upstream-sync-20260925.md)
+for the published integration, release identity, and validation evidence.
 
 ## Configuration
 
