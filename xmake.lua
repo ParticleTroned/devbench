@@ -187,6 +187,9 @@ set_languages("c++23")
 add_packages("nlohmann_json", "stb")
 add_includedirs("src")
 add_files("tests/*.cpp")
+add_deps("cpp-mcp", { inherit = false })
+add_includedirs("tests/mcp", "build/cpp-mcp-patched/include")
+add_files("src/McpAdapter.cpp") -- real adapter against a notification-capturing server
 add_files("src/ToolRegistry.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/Ssim.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/KeyboardInputState.cpp") -- key resolution + lease ownership; pure logic
