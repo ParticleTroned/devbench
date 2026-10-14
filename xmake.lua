@@ -187,6 +187,9 @@ set_languages("c++23")
 add_packages("nlohmann_json", "stb")
 add_includedirs("src")
 add_files("tests/*.cpp")
+add_deps("cpp-mcp", { inherit = false })
+add_includedirs("tests/mcp", "build/cpp-mcp-patched/include")
+add_files("src/McpAdapter.cpp") -- real adapter against a notification-capturing server
 add_files("src/ToolRegistry.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/Ssim.cpp") -- exercised directly; pure logic, no game deps
 add_files("src/KeyboardInputState.cpp") -- key resolution + lease ownership; pure logic
@@ -199,5 +202,19 @@ set_pcxxheader("tests/pch.h")
 add_defines("_WINSOCKAPI_")
 -- /EHsc: the suite asserts on thrown exceptions (CHECK_THROWS). /utf-8 matches
 -- the main target so the shared nlohmann_json headers parse identically.
+add_cxflags("/utf-8", "/EHsc", { force = true })
+target_end()
+
+-- Real Streamable HTTP/SSE regression tests; isolated from the game and adapter stub.
+target("devbench-mcp-tests")
+set_kind("binary")
+set_default(false)
+set_languages("c++23")
+add_deps("cpp-mcp")
+add_packages("nlohmann_json")
+add_includedirs("src", "tests")
+add_files("tests/test_main.cpp", "tests/mcp_http/*.cpp", "src/McpAdapter.cpp", "src/ToolRegistry.cpp")
+set_pcxxheader("tests/pch.h")
+add_defines("_WINSOCKAPI_")
 add_cxflags("/utf-8", "/EHsc", { force = true })
 target_end()

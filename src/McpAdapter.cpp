@@ -45,7 +45,7 @@ namespace dvb
 			// re-registers the enriched base-tool descriptor). Tell connected clients to re-list.
 			if (m_announceChanges)
 				m_server.broadcast_notification(mcp::request::create_notification(
-					"notifications/tools/list_changed", json::object()));
+					"tools/list_changed", json::object()));
 		};
 
 		for (const auto& desc : m_registry.List())
@@ -60,8 +60,8 @@ namespace dvb
 		// Forward bus events to connected MCP clients as notifications.
 		m_sub = m_events.Subscribe([this](const EventBus::Event& a_ev) {
 			m_server.broadcast_notification(mcp::request::create_notification(
-				"notifications/message",
-				json{ { "topic", a_ev.topic }, { "seq", a_ev.seq }, { "data", a_ev.payload } }));
+				"message",
+				json{ { "level", "info" }, { "logger", "devbench" }, { "topic", a_ev.topic }, { "seq", a_ev.seq }, { "data", a_ev.payload } }));
 		});
 	}
 }

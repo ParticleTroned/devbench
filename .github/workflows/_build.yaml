@@ -76,6 +76,8 @@ jobs:
         run: |
           xmake build --yes devbench-tests
           xmake run devbench-tests
+          xmake build --yes devbench-mcp-tests
+          xmake run devbench-mcp-tests
 
       - uses: actions/setup-python@v7
         with:

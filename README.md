@@ -91,9 +91,22 @@ Two ways to connect an MCP client, for two different needs:
 xmake, C++23, CommonLibSSE-NG (submodule). cpp-mcp is vendored as the `lib/cpp-mcp`
 submodule and built in-tree as a static-lib target (`xmake/cpp-mcp.lua`, mirroring
 Community Shaders' `cmake/cpp-mcp.cmake`): only its four server TUs are compiled, and a
-build-tree header mirror applies two edits — pointing `mcp_message.h` at our
-`nlohmann/json.hpp` (single ABI) and adding a public `http()` getter to `mcp_server.h` so
-the REST facade can share the MCP port.
+build-tree mirror shares our `nlohmann/json.hpp` ABI and exposes the HTTP server
+for the REST facade. It also uses a bounded FIFO for SSE delivery and announces
+the tool catalog when clients initialize. Slow consumers whose queues overflow
+must establish a new session instead of silently retaining stale schemas.
+
+Run the offline unit and real HTTP/SSE regression suites without Skyrim:
+
+```sh
+xmake build devbench-tests
+xmake run devbench-tests
+xmake build devbench-mcp-tests
+xmake run devbench-mcp-tests
+```
+
+The transport suite binds isolated ephemeral loopback ports and verifies catalog
+announcements, schema replacement, queued delivery, and session recovery.
 
 ```
 git submodule update --init --recursive
