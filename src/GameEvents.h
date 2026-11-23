@@ -16,9 +16,10 @@ namespace dvb
 	/// Install game event sources that publish into `a_bus`:
 	///  - a MenuOpenCloseEvent sink → "menu" events { name, opening } (loading screens,
 	///    main menu, new-game message boxes, etc.).
+	/// With a_observeGameEvents=false, only SKSE lifecycle forwarding is wired.
 	/// SKSE-messaging lifecycle events are forwarded separately via OnSKSEMessage.
 	/// Call once, after the server's EventBus exists (kDataLoaded).
-	void InstallGameEvents(EventBus& a_bus);
+	void InstallGameEvents(EventBus& a_bus, bool a_observeGameEvents = true);
 
 	/// Forward an SKSE MessagingInterface message type; publishes a "lifecycle" event
 	/// (dataLoaded / newGame / preLoadGame / postLoadGame / saveGame / deleteGame).

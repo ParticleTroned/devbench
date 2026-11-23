@@ -40,6 +40,78 @@ shared registry every mod can extend.
   registers into the **same** server, one agent session can orchestrate across your whole load
   order. [Open Shaders](https://github.com/alandtse/open-shaders) does this today.
 
+## Production CSX performance profile
+
+Build a separate minimal DevBench DLL with:
+
+```sh
+xmake f --performance_profile=y -m releasedbg
+xmake build devbench
+```
+
+Unset `SkyrimPluginTargets` when building without deployment. The DLL reports
+`.performance` in its version and `profile: "performance"` in health and
+inspection responses. Use `--performance_profile=n` to restore the full
+profile (the default). Both profiles support SE, AE and VR through CommonLib.
+
+This profile exposes only `game` (list/load/loadLast), `inspect`
+(state/scene/health/registrants), `ping`, `mcp_bridge_setup`,
+`communityshaders.profiler_api`, `communityshaders.performance_tuning` and
+`communityshaders.screenshot`. It reuses the existing REST/MCP transports and
+save loader. It does not initialize the watchdog, recording/replay, autorun,
+console hooks, input hooks, menu/cell event sinks, in-game menus or external
+plugin tool registration. SKSE lifecycle messages remain available for load
+completion. The transport still has listener/event delivery threads; there
+is no per-frame polling or observer installed by this profile.
+
+Use production CSX with the `csx.performance` 1.0, `csx.profiler` 1.3 and
+`csx.screenshot` 1.0 public APIs. Instrumentation flags must be zero: the
+adapter refuses CSX built with its developer bridge or Tracy enabled.
+The API headers in `include/CSX/` mirror [CSX](https://github.com/ParticleTroned/skyrim-community-shaders)'s `include/VRAPI/` contracts;
+keep their declarations synchronized when updating an ABI. No CSX private headers
+or render hooks are used.
+
+Every CSX tool request uses `contractMajor: 1`, `clientId`, `commandId` and
+`action`. Use a stable client ID, a new command ID per mutation and the same
+command ID for an identical retry. The profiler retains the last 64 mutation
+receipts. Native services own their own bounded receipts. Optional
+`expectedBuildId` pins the CSX producer for profiler and performance calls.
+
+Load a fixed save, wait for its `postLoadGame` lifecycle event, verify
+`inspect` state/scene, and let rendering and shader compilation settle.
+Then call the performance tool with:
+
+```json
+{
+  "contractMajor": 1,
+  "clientId": "benchmark",
+  "commandId": "indoor-1",
+  "action": "start_quick_scan_batch",
+  "recordFpsVR": true
+}
+```
+
+CSX runs three scans with ten-second gaps and saves CSV/HTML results using
+its existing controller. `recordFpsVR` is optional and requires fpsVR already
+running. Poll `status`, then `results_status`; inspect `accepted`, errors and
+terminal state instead of treating a successful transport reply as completion.
+Saved-result exports require an explicit `directory` and complete asynchronously.
+Use the same session for multiple measurements to retain CSX's cumulative HTML.
+
+For pass profiling, explicitly `set_enabled`, `start_capture` with
+`frameCount` 1–300, poll `capture_status`, then page `capture_export` using
+`offset`/`limit` (up to 128 timers per page). Only the initiating client can
+cancel its capture. Restore the prior enabled setting after use. Exports
+include capture quality; invalid or incomplete frames are not a valid timing
+comparison. Profiling, screenshots and API polling themselves have a cost:
+keep polling sparse, take screenshots outside measurement windows, and match
+measurement settings across builds. Scan ownership blocks conflicting profiler
+mutations, screenshot starts and save loads.
+
+The full DevBench profile and legacy CSX diagnostic tools remain separate.
+Collectors must discover the advertised tools/actions; this profile does not
+supply the full profile's legacy profiler, input or replay tools.
+
 ## Design
 
 ```

@@ -1,4 +1,6 @@
 #include "Tools.h"
+#include "BuildProfile.h"
+#include "PerformanceTools.h"
 
 #include "Capture.h"
 #include "ConsoleLogCapture.h"
@@ -523,7 +525,8 @@ namespace dvb
 				if (saves.empty())
 					throw ToolError(404, std::format("no .ess saves in {}", saveDir.string()));
 				const std::string name = saves.front().name;
-				Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
+				if constexpr (!PerformanceProfile)
+					Recording::NoteLoadEntry(name);
 				task->AddTask([name]() {
 					if (auto* m = RE::BGSSaveLoadManager::GetSingleton())
 						m->Load(name.c_str(), false);
@@ -545,7 +548,8 @@ namespace dvb
 						[&](const SaveEntry& s) { return s.name == name; });
 					if (!exists)
 						throw ToolError(404, std::format("save '{}' not found in {} — use action='list' for valid names", name, saveDir.string()));
-					Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
+					if constexpr (!PerformanceProfile)
+						Recording::NoteLoadEntry(name);
 				}
 				if (isSave) {
 					// SKSE tasks can run on worker threads. Synchronous Save can deadlock
@@ -2233,6 +2237,55 @@ namespace dvb
 		// inspect/menu descriptors are REBUILT (not frozen at startup) so registered keys appear in
 		// tools/list. RegisterCoreTools registers these initially; the ToolExtensions change-listener
 		// re-registers them when a mod adds a kind/menu (which also fires tools/list_changed).
+		ToolDescriptor BuildGameDescriptor()
+		{
+			ToolDescriptor game;
+			game.name = "game";
+			game.description =
+				"Save/load and list saves. action='list' returns { count, returned, truncated, saves: "
+				"[{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — "
+				"count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps "
+				"only names containing a substring (case-insensitive; save names embed the location, "
+				"e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' "
+				"object per matched save (characterName, location, race, level, experience, playTime, saveNumber, "
+				"saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from "
+				"the save's own .ess header, same bytes the vanilla Load menu shows, so it works even "
+				"before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; "
+				"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
+				"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
+				"confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / "
+				"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
+				"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
+				"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
+				"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
+				"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
+				"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
+				"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
+				"it returns { requested, effective, applied, owner, leaseRemainingMs } only once the "
+				"engine is actually running at the requested scale (the reconciler applies it on the next "
+				"frame and the engine then ramps). It is refused (409) while a recording or a capture is "
+				"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without "
+				"changing anything.";
+			game.inputSchema = json{
+				{ "type", "object" },
+				{ "properties", json{
+									{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "advanceTime", "getTimeScale", "setTimeScale" }) }, { "description", "list | save | load | loadLast | advanceTime | getTimeScale | setTimeScale" } } },
+									{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load; from action='list')" } } },
+									{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath)" } } },
+									{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
+									{ "limit", json{ { "type", "integer" }, { "description", "list only: cap the number of saves returned (newest-first); must be > 0 if given" } } },
+									{ "detail", json{ { "type", "boolean" }, { "description", "list only: add per-save character/location/level metadata (default false)" } } },
+									{ "hours", json{ { "type", "number" }, { "description", "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)" } } },
+									{ "scale", json{ { "type", "number" }, { "description", "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)" } } },
+									{ "holdMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)" } } },
+									{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
+									{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
+									{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
+								} },
+			};
+			return game;
+		}
+
 		ToolDescriptor BuildInspectDescriptor()
 		{
 			ToolDescriptor inspect;
@@ -2324,6 +2377,10 @@ namespace dvb
 	/// Register built-in handlers and their shared REST/MCP discovery contracts.
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
+		if constexpr (PerformanceProfile) {
+			RegisterPerformanceTools(a_registry, BuildGameDescriptor(), GameHandler, BuildInspectDescriptor(), InspectHandler);
+			return;
+		}
 		RegisterInputTool(a_registry, a_events);
 
 		ToolDescriptor console;
@@ -2353,51 +2410,7 @@ namespace dvb
 		};
 		a_registry.Register(std::move(console), &ConsoleHandler);
 
-		ToolDescriptor game;
-		game.name = "game";
-		game.description =
-			"Save/load and list saves. action='list' returns { count, returned, truncated, saves: "
-			"[{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — "
-			"count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps "
-			"only names containing a substring (case-insensitive; save names embed the location, "
-			"e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' "
-			"object per matched save (characterName, location, race, level, experience, playTime, saveNumber, "
-			"saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from "
-			"the save's own .ess header, same bytes the vanilla Load menu shows, so it works even "
-			"before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; "
-			"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
-			"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
-			"confirmation modal). All but 'list' are fire-and-forget; watch lifecycle events / "
-			"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
-			"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
-			"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
-			"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
-			"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
-			"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
-			"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
-			"it returns { requested, effective, applied, owner, leaseRemainingMs } only once the "
-			"engine is actually running at the requested scale (the reconciler applies it on the next "
-			"frame and the engine then ramps). It is refused (409) while a recording or a capture is "
-			"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns the same object without "
-			"changing anything.";
-		game.inputSchema = json{
-			{ "type", "object" },
-			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "advanceTime", "getTimeScale", "setTimeScale" }) }, { "description", "list | save | load | loadLast | advanceTime | getTimeScale | setTimeScale" } } },
-								{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load; from action='list')" } } },
-								{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath)" } } },
-								{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
-								{ "limit", json{ { "type", "integer" }, { "description", "list only: cap the number of saves returned (newest-first); must be > 0 if given" } } },
-								{ "detail", json{ { "type", "boolean" }, { "description", "list only: add per-save character/location/level metadata (default false)" } } },
-								{ "hours", json{ { "type", "number" }, { "description", "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)" } } },
-								{ "scale", json{ { "type", "number" }, { "description", "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)" } } },
-								{ "holdMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)" } } },
-								{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
-								{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
-								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
-							} },
-		};
-		a_registry.Register(std::move(game), &GameHandler);
+		a_registry.Register(BuildGameDescriptor(), &GameHandler);
 
 		ToolDescriptor camera;
 		camera.name = "camera";

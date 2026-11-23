@@ -1,4 +1,5 @@
 #include "GameEvents.h"
+#include "BuildProfile.h"
 
 #include "EventBus.h"
 #include "Json.h"
@@ -112,9 +113,11 @@ namespace dvb
 		// replay, if ever wanted, needs a lower-frequency or off-main-thread approach, not this.
 	}
 
-	void InstallGameEvents(EventBus& a_bus)
+	void InstallGameEvents(EventBus& a_bus, bool a_observeGameEvents)
 	{
 		g_bus = &a_bus;
+		if (!a_observeGameEvents)
+			return;
 		if (auto* ui = RE::UI::GetSingleton())
 			ui->AddEventSink<RE::MenuOpenCloseEvent>(&g_menuSink);
 		if (auto* holder = RE::ScriptEventSourceHolder::GetSingleton())
@@ -149,7 +152,8 @@ namespace dvb
 			return;
 		}
 		g_bus->Publish("lifecycle", json{ { "event", event } });
-		Recording::NoteLifecycleEvent(event);
+		if constexpr (!PerformanceProfile)
+			Recording::NoteLifecycleEvent(event);
 	}
 
 	std::vector<std::string> GetOpenMenus()

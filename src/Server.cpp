@@ -1,4 +1,5 @@
 #include "Server.h"
+#include "BuildProfile.h"
 
 #include "McpAdapter.h"
 #include "RestAdapter.h"
@@ -280,7 +281,7 @@ namespace dvb
 		static const int         pid = static_cast<int>(::GetCurrentProcessId());
 		static const std::string exe = ExecutableName();
 		static const bool        vr = REL::Module::IsVR();
-		return json{ { "pid", pid }, { "port", BoundPort() }, { "exe", exe }, { "vr", vr } };
+		return json{ { "pid", pid }, { "port", BoundPort() }, { "exe", exe }, { "vr", vr }, { "profile", BuildProfileName } };
 	}
 
 	json BridgeDiscoveryInfo()
