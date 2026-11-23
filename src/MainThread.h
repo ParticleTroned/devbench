@@ -13,7 +13,8 @@ namespace dvb::MainThread
 	{
 		bool started;
 		TaskTimeout(bool a_started, const std::string& a_message) :
-			ToolError(504, a_message), started(a_started) {}
+			ToolError(504, a_message, { { "taskStarted", a_started },
+				{ "outcome", a_started ? "unknown" : "not_started" }, { "retrySafe", !a_started } }), started(a_started) {}
 	};
 
 	/// Run `a_fn` on the main game thread (via SKSE's TaskInterface) and block the

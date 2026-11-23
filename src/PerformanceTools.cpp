@@ -182,13 +182,15 @@ namespace dvb
 					const auto& performance = ProductionApi();
 					auto        producer = Producer(args);
 					const auto  action = args.at("action").get<std::string_view>();
+
+					const auto&              api = Query<ProfilerAPI::Interface003>(ProfilerAPI::ServiceName, ProfilerAPI::QualityServiceMinor);
+					static CsxProfilerClient client;
+					auto                     result = client.Dispatch(api, args, producer.at("buildId").get<std::string>(), [&] {
 					if (action == "set_enabled" || action == "clear_history" || action == "start_capture") {
 						RequireIdle(performance);
 						RequireScreenshotIdle();
 					}
-					const auto&              api = Query<ProfilerAPI::Interface003>(ProfilerAPI::ServiceName, ProfilerAPI::QualityServiceMinor);
-					static CsxProfilerClient client;
-					auto                     result = client.Dispatch(api, args, producer.at("buildId").get<std::string>());
+					});
 					return json{ { "ok", true }, { "producer", std::move(producer) }, { "result", std::move(result) } };
 				});
 			});
@@ -196,25 +198,39 @@ namespace dvb
 		registry.Register({ "communityshaders.performance_tuning", "Production CSX performance controls and saved results. Uses the CSX API contract; requests require contractMajor=1, clientId, commandId and action. Scan batches run three scans with ten-second gaps and automatic export; recordFpsVR is optional. Export actions require an explicit directory.", PerformanceSchema(), false },
 			[](const json& args, const ToolContext&) {
 				PerformanceToolPolicy::Validate(PerformanceSchema(), args);
-				return MainThread::RunAndWait([args] { const auto& api = ProductionApi(); Producer(args);
+				return MainThread::RunAndWait([args] {
+					const auto& api = ProductionApi();
+					const auto producer = Producer(args);
 					const auto action = args.at("action").get<std::string_view>();
-					if (action.starts_with("start_") || action == "set_feature_enabled")
-						RequireScreenshotIdle();
-					return Forward<PerformanceAPI::Request001, PerformanceAPI::Response001>(api, args, PerformanceAPI::MaximumRequestBytes); });
+					static CsxCommandJournal journal;
+					return journal.Dispatch(producer.at("buildId").get<std::string>(), args, action != "status" && action != "results_status", [&] {
+						if (action.starts_with("start_") || action == "set_feature_enabled")
+							RequireScreenshotIdle();
+						return Forward<PerformanceAPI::Request001, PerformanceAPI::Response001>(api, args, PerformanceAPI::MaximumRequestBytes);
+					});
+				});
 			});
 		registry.Register({ "communityshaders.screenshot", "Production CSX asynchronous screenshot API. Rejects capture and sequence_start during measurements or profiler captures; poll request_get for terminal artifact status. Native CSX validates requests and owns encoding, cancellation and receipts.", ScreenshotSchema(), false },
 			[](const json& args, const ToolContext&) {
-				if (!args.is_object() || (args.contains("action") && !args["action"].is_string()))
+				if (!args.is_object() || !args.contains("action") || !args["action"].is_string())
 					throw ToolError(400, "Invalid screenshot request");
+				for (const auto* key : { "clientId", "commandId" })
+					if (!args.contains(key) || !args[key].is_string() || args[key].get_ref<const std::string&>().empty() || args[key].get_ref<const std::string&>().size() > 128)
+						throw ToolError(400, "Bounded clientId and commandId strings are required");
 				return MainThread::RunAndWait([args] {
 					const auto& performance = ProductionApi();
-					Producer(args);
-					if (args.is_object() && (args.value("action", "") == "capture" || args.value("action", "") == "sequence_start")) {
-						RequireIdle(performance);
-						RequireProfilerIdle();
-					}
-					const auto& api = ScreenshotApi();
-					return Forward<ScreenshotAPI::Request001, ScreenshotAPI::Response001>(api, args, ScreenshotAPI::MaximumRequestBytes);
+					const auto producer = Producer(args);
+					const auto action = args.at("action").get<std::string_view>();
+					const bool mutation = action != "capabilities" && action != "status" && action != "settings_get" && action != "settings_validate" &&
+						action != "request_get" && action != "request_list" && action != "events_poll";
+					static CsxCommandJournal journal;
+					return journal.Dispatch(producer.at("buildId").get<std::string>(), args, mutation, [&] {
+						if (action == "capture" || action == "sequence_start") {
+							RequireIdle(performance);
+							RequireProfilerIdle();
+						}
+						return Forward<ScreenshotAPI::Request001, ScreenshotAPI::Response001>(ScreenshotApi(), args, ScreenshotAPI::MaximumRequestBytes);
+					});
 				});
 			});
 	}

@@ -2,7 +2,8 @@
 
 #include "CSX/CSprofilerapi.h"
 #include "ToolRegistry.h"
-#include <deque>
+#include "CsxCommandJournal.h"
+#include <functional>
 
 namespace dvb
 {
@@ -10,15 +11,10 @@ namespace dvb
 	class CsxProfilerClient
 	{
 	public:
-		json Dispatch(const CSX::ProfilerAPI::Interface003& service, const json& args, const std::string& buildId);
+		json Dispatch(const CSX::ProfilerAPI::Interface003& service, const json& args, const std::string& buildId, const std::function<void()>& admit = {});
 
 	private:
-		struct Receipt
-		{
-			std::string build, client, command;
-			json        request, result;
-		};
-		std::deque<Receipt> receipts;
+		CsxCommandJournal journal;
 		std::string         owner, ownerBuild;
 		std::uint64_t       ownedCapture = 0;
 	};

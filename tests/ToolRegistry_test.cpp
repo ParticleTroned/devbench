@@ -1,3 +1,4 @@
+#include "MainThread.h"
 // Host-independent coverage for ToolRegistry: registration, dispatch, and the
 // exception->ToolResult folding that the adapters rely on (no exception is ever
 // allowed to cross the adapter boundary).
@@ -118,4 +119,20 @@ TEST_CASE("registration listener fires for tools added after wiring")
 	reg.Register(Desc("late"), [](const json&, const ToolContext&) { return json::object(); });
 	CHECK(seen == 1);
 	CHECK(lastName == "late");
+}
+
+TEST_CASE("task timeouts retain started and retry-safe outcomes")
+{
+	for (const bool started : { false, true }) {
+		dvb::ToolRegistry registry;
+		registry.Register({ "load-test", "test", dvb::DefaultInputSchema(), false },
+			[started](const dvb::json&, const dvb::ToolContext&) -> dvb::json { throw dvb::MainThread::TaskTimeout(started, "timed out"); });
+		const auto result = registry.Invoke("load-test", dvb::json::object(), {});
+		CHECK(!result.ok);
+		CHECK(result.errorCode == 504);
+		CHECK(result.errorDetails["taskStarted"] == started);
+		CHECK(result.errorDetails["retrySafe"] == !started);
+		CHECK(result.errorDetails["outcome"] == (started ? "unknown" : "not_started"));
+		CHECK(result.ErrorJson()["details"] == result.errorDetails);
+	}
 }

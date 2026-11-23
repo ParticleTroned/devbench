@@ -166,7 +166,7 @@ namespace dvb
 		}
 
 	}
-	json CsxProfilerClient::Dispatch(const CSX::ProfilerAPI::Interface003& service, const json& args, const std::string& buildId)
+	json CsxProfilerClient::Dispatch(const CSX::ProfilerAPI::Interface003& service, const json& args, const std::string& buildId, const std::function<void()>& admit)
 	{
 		PerformanceToolPolicy::ValidateProfiler(args);
 		using namespace CSX::ProfilerAPI;
@@ -178,13 +178,11 @@ namespace dvb
 		const auto        action = args.at("action").get<std::string>();
 		const bool        mutation = action == "set_enabled" || action == "clear_history" || action == "start_capture" || action == "cancel_capture";
 		const std::string client = args.at("clientId").get<std::string>();
-		const std::string command = args.at("commandId").get<std::string>();
-		for (const auto& receipt : receipts) {
-			if (!mutation || receipt.build != buildId || receipt.client != client || receipt.command != command)
-				continue;
-			if (receipt.request != args)
-				throw ToolError(409, "commandId was already used with different arguments");
-			return receipt.result;
+		if (mutation) {
+			if (const auto receipt = journal.Find(buildId, args))
+				return *receipt;
+			if (admit)
+				admit();
 		}
 		json result;
 		if (action == "snapshot")
@@ -226,11 +224,8 @@ namespace dvb
 			}
 		} else
 			throw ToolError(400, "Unsupported profiler action");
-		if (mutation) {
-			if (receipts.size() == 64)
-				receipts.pop_front();
-			receipts.push_back({ buildId, client, command, args, result });
-		}
+		if (mutation)
+			journal.Remember(buildId, args, result);
 		return result;
 	}
 }
