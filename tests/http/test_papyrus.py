@@ -62,6 +62,36 @@ def test_call_game_getplayer(client, papyrus):
     assert body.get("returnedType") == "Actor", body
 
 
+# Skyrim.esm's TGNightingalePowerHandler carries two scripts: its stage fragments and
+# TGNQuestScript, whose CanIAward() only reads the game time.
+TGN_QUEST = "0x0010B0E0"
+
+
+@pytest.mark.requires_player
+def test_call_returns_form_behind_attached_script(client, papyrus):
+    require_enum(papyrus, "action", "call")
+    body = client.ok(
+        "papyrus",
+        {"action": "call", "script": "Quest", "function": "GetQuest", "args": ["TGNightingalePowerHandler"]},
+    )
+    assert body.get("returned", {}).get("formId") == TGN_QUEST, body
+
+
+@pytest.mark.requires_player
+def test_call_member_of_named_attached_script(client, papyrus):
+    require_enum(papyrus, "action", "call")
+    body = client.ok(
+        "papyrus",
+        {
+            "action": "call",
+            "script": "TGNQuestScript",
+            "function": "CanIAward",
+            "self": {"form": TGN_QUEST},
+        },
+    )
+    assert isinstance(body.get("returned"), bool), body
+
+
 def test_call_game_getgamesettingfloat(client, papyrus):
     require_enum(papyrus, "action", "call")
     body = client.ok(
@@ -109,19 +139,73 @@ def test_call_member_getnumitems(client, papyrus):
     assert returned >= 0, body
 
 
-def test_call_pads_omitted_optional_args(client, papyrus):
-    # DispatchStaticCall/MethodCall don't fill Papyrus optional-param defaults, so
-    # omitting them makes the native read unset slots and no-op (e.g. MoveTo/Disable
-    # with their optional flag omitted ran but did nothing). devbench pads omitted
-    # trailing optionals with the type's neutral value. Utility.RandomInt(0, 100)
-    # called with no args therefore pads to RandomInt(0, 0) -> a deterministic 0,
-    # proving the padding happened and the call no longer no-ops.
+@pytest.mark.requires_player
+def test_call_passes_null_as_none(client, papyrus):
+    # RemoveItem's akOtherContainer = None: the removed gold is gone, not moved anywhere.
     require_enum(papyrus, "action", "call")
-    body = client.ok("papyrus", {"action": "call", "script": "Utility", "function": "RandomInt"})
+
+    def player(function, *args):
+        return client.ok(
+            "papyrus",
+            {"action": "call", "script": "ObjectReference", "function": function,
+             "self": {"form": "0x14"}, "args": list(args)},
+        )
+
+    gold = {"form": "0xF"}
+    before = player("GetItemCount", gold)["returned"]
+    player("AddItem", gold, 1, True)
+    body = player("RemoveItem", gold, 1, True, None)
     assert body.get("called") is True, body
-    returned = body.get("returned")
-    assert isinstance(returned, int) and not isinstance(returned, bool), body
-    assert returned == 0, body  # padded to RandomInt(0, 0)
+    assert "filledArgs" not in body, body
+    assert player("GetItemCount", gold)["returned"] == before
+
+
+@pytest.mark.requires_player
+def test_call_refuses_null_for_scalar_param(client, papyrus):
+    # None fits only object and array params; an int param must refuse it before dispatch.
+    require_enum(papyrus, "action", "call")
+    status, body = client.call(
+        "papyrus",
+        {"action": "call", "script": "Utility", "function": "RandomInt", "args": [None, 1]},
+    )
+    assert status == 400, (status, body)
+    assert isinstance(body, dict) and body.get("code") == 400, body
+
+
+def test_call_fills_a_known_default_from_the_table(client, papyrus):
+    require_enum(papyrus, "action", "call")
+    body = client.ok(
+        "papyrus", {"action": "call", "script": "Utility", "function": "RandomInt", "args": [0]}
+    )
+    assert body.get("called") is True, body
+    assert 0 <= body.get("returned") <= 100, body
+    filled = body.get("filledArgs")
+    assert isinstance(filled, list) and len(filled) == 1, body
+    assert filled[0]["source"] == "table" and filled[0]["value"] == 100, body
+    assert "warning" not in body, body
+
+
+def test_call_refuses_an_omitted_arg_with_no_known_default(client, papyrus):
+    require_enum(papyrus, "action", "call")
+    status, body = client.call(
+        "papyrus", {"action": "call", "script": "Utility", "function": "RandomInt"}
+    )
+    assert status == 400, (status, body)
+    assert "no known default" in body.get("error", ""), body
+
+
+def test_call_fill_neutral_guesses_and_warns(client, papyrus):
+    require_enum(papyrus, "action", "call")
+    body = client.ok(
+        "papyrus",
+        {"action": "call", "script": "Utility", "function": "RandomInt", "fillNeutral": True},
+    )
+    assert body.get("called") is True, body
+    assert 0 <= body.get("returned") <= 100, body
+    sources = [f["source"] for f in body.get("filledArgs", [])]
+    assert sources == ["neutral", "table"], body
+    assert body.get("filledArgs")[0]["value"] == 0, body
+    assert "warning" in body, body
 
 
 def test_call_bogus_function_errors(client, papyrus):

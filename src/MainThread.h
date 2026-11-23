@@ -16,6 +16,13 @@ namespace dvb::MainThread
 			ToolError(504, a_message), started(a_started) {}
 	};
 
+	/// Which SKSE queue runs a task. Scaleform work belongs on kUi; only kMain tasks count toward PendingTasks and LastCompletedFrame.
+	enum class Queue
+	{
+		kMain,
+		kUi
+	};
+
 	/// Run `a_fn` on the main game thread (via SKSE's TaskInterface) and block the
 	/// calling (listener) thread until it returns, propagating its JSON result — or
 	/// rethrowing whatever it threw (e.g. a dvb::ToolError) on the caller's thread.
@@ -26,6 +33,8 @@ namespace dvb::MainThread
 	/// does not finish within `a_timeout` (e.g. the main thread is stalled mid-load).
 	/// Tasks still queued at their deadline are abandoned and will not invoke a_fn.
 	/// Already-running tasks cannot be interrupted and may finish after a timeout.
+	/// A frame observation during this wait is not a hang diagnosis, readiness proof,
+	/// or evidence that a process restart is necessary. Do not replay started work.
 	///
 	/// MUST be called from a non-main thread (the server listener). Calling it on the
 	/// main thread would deadlock — the task can never run while this blocks.
@@ -36,7 +45,8 @@ namespace dvb::MainThread
 	/// An already completed result or exception is still returned; running tasks may finish.
 	json RunAndWait(std::function<json()> a_fn,
 		std::chrono::milliseconds         a_timeout = std::chrono::milliseconds(5000),
-		const std::atomic<bool>*          a_keepWaiting = nullptr);
+		const std::atomic<bool>*          a_keepWaiting = nullptr,
+		Queue                             a_queue = Queue::kMain);
 
 	/// Engine frame at which the most recently queued main-thread task finished (success or
 	/// throw), or -1 if none has run yet. Lock-free; safe to call from the listener thread.

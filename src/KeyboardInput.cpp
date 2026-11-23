@@ -6,6 +6,7 @@
 #include "KeyboardInputState.h"
 #include "MainThread.h"
 #include "MainThreadTask.h"
+#include "MouseInput.h"
 #include "ToolRegistry.h"
 #include "VRInput.h"
 #include "VRInputState.h"
@@ -19,6 +20,7 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -43,6 +45,23 @@ namespace dvb
 		constexpr auto        kWatchdogRetryDelay = seconds(1);
 
 		std::atomic<bool> g_inputReady{ false };
+
+		RE::INPUT_DEVICE DeviceOf(std::uint16_t a_code)
+		{
+			return EngineButtonOf(a_code).device == EngineDevice::kMouse ? RE::INPUT_DEVICE::kMouse : RE::INPUT_DEVICE::kKeyboard;
+		}
+
+		// Unsigned on purpose: an std::int32_t id binds BSInputEventQueue's VR-only AddButtonEvent overload, which does
+		// nothing on SE/AE, instead of the AddEvent<ButtonEvent> template every runtime uses.
+		std::uint32_t IdCodeOf(std::uint16_t a_code) { return static_cast<std::uint32_t>(EngineButtonOf(a_code).id); }
+
+		// An interned empty string, not a null BSFixedString: MenuControls only forwards keys whose userEvent is non-null.
+		// Leaked so it is not released at exit.
+		const RE::BSFixedString& DeviceUserEvent()
+		{
+			static const auto* empty = new RE::BSFixedString("");
+			return *empty;
+		}
 
 		std::int64_t NowMs()
 		{
@@ -134,19 +153,23 @@ namespace dvb
 					continue;
 				if (queue->buttonEventCount >= RE::BSInputEventQueue::MAX_BUTTON_EVENTS)
 					break;
-				// Do not emit a held event in the same poll as the initial down.
+				// Do not emit a held event in the same poll as the initial down; a queued release of the
+				// same button does not stand in for it.
 				bool queued = false;
 				for (auto* event = queue->GetQueueHead(); event; event = event->next) {
 					const auto* button = event->AsButtonEvent();
-					if (button && button->device == RE::INPUT_DEVICE::kKeyboard &&
-						button->GetIDCode() == key.scancode) {
+					if (!button || (button->device != RE::INPUT_DEVICE::kKeyboard && button->device != RE::INPUT_DEVICE::kMouse))
+						continue;
+					const EngineButton seen{ button->device == RE::INPUT_DEVICE::kMouse ? EngineDevice::kMouse : EngineDevice::kKeyboard,
+						static_cast<std::int32_t>(button->GetIDCode()) };
+					if (QueuedPressCovers(seen, button->Value(), key.scancode)) {
 						queued = true;
 						break;
 					}
 				}
 				if (!queued) {
 					const float heldSecs = HeldDownSeconds(key.pressedAtGameMs, gameNow);
-					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, 0, key.scancode, 1.0F, heldSecs);
+					queue->AddButtonEvent(DeviceOf(key.scancode), 0, IdCodeOf(key.scancode), 1.0F, heldSecs, DeviceUserEvent());
 				}
 			}
 		}
@@ -178,8 +201,7 @@ namespace dvb
 			if (a_args["key"].is_string())
 				key = ResolveKeyboardKey(a_args["key"].get<std::string>());
 			else if (a_args["key"].is_number_integer()) {
-				const auto value = BoundedInteger(a_args, "key", 0, 0,
-					std::numeric_limits<std::uint16_t>::max());
+				const auto value = BoundedInteger(a_args, "key", 0, 0, kMouseCodeLast);
 				key = ResolveKeyboardKey(value);
 			} else
 				throw ToolError(400, "'key' must be a string name or integer DirectInput scancode");
@@ -207,7 +229,9 @@ namespace dvb
 
 		json KeyJson(const KeyboardKey& a_key)
 		{
-			return json{ { "key", a_key.name }, { "scancode", a_key.scancode } };
+			const auto engine = EngineButtonOf(a_key.scancode);
+			return json{ { "key", a_key.name }, { "scancode", a_key.scancode }, { "codeDomain", CodeDomainOf(a_key.scancode) },
+				{ "engineDevice", EngineDeviceName(engine.device) }, { "engineId", engine.id } };
 		}
 
 		json ContractJson()
@@ -268,7 +292,9 @@ namespace dvb
 															{ "maximumSequenceEvents", kMaximumSequenceEvents },
 															{ "maximumSequenceMs", kMaximumSequenceMs },
 															{ "keys", std::move(keys) },
+															{ "mouseButtons", json{ { "codeBase", kMouseCodeBase }, { "codeDomain", "mouseButton" }, { "engineDevice", "mouse" }, { "keys", json::array({ "mouseLeft", "mouseRight", "mouseMiddle" }) } } },
 														} },
+										  { "mouse", json{ { "actions", json::array({ "move", "down", "up", "tap", "click", "status" }) }, { "buttons", json::array({ "left", "right", "middle" }) }, { "coordinates", "game-window client pixels" } } },
 										  { "vrTrackedSet", VRInputCapabilities() },
 									  } },
 				};
@@ -548,8 +574,8 @@ namespace dvb
 						if (g_repeatingKeys.empty())
 							DisengageForHold();
 					}
-					queue->AddButtonEvent(RE::INPUT_DEVICE::kKeyboard, 0, a_lease.key.scancode,
-						a_down ? 1.0F : 0.0F, a_down ? 0.0F : a_heldSecs);
+					queue->AddButtonEvent(DeviceOf(a_lease.key.scancode), 0, IdCodeOf(a_lease.key.scancode),
+						a_down ? 1.0F : 0.0F, a_down ? 0.0F : a_heldSecs, DeviceUserEvent());
 					return json{ { "frame", game::CurrentFrame() } };
 				});
 				if (completion.wait_for(milliseconds(0)) != std::future_status::ready)
@@ -761,8 +787,24 @@ namespace dvb
 			const std::string device = a_args.value("device", std::string("keyboard"));
 			if (IsVRInputDevice(device))
 				return HandleVRInput(a_args, a_ctx);
+			if (device == "mouse") {
+				if (action == "move" || action == "status")
+					return HandleMousePointer(a_args);
+				// Buttons are the keyboard path's mouse keys; 'click' is a tap.
+				static const std::map<std::string, std::string, std::less<>> kButtons{ { "left", "mouseLeft" }, { "right", "mouseRight" }, { "middle", "mouseMiddle" } };
+				const auto                                                   button = kButtons.find(a_args.value("button", std::string("left")));
+				if (button == kButtons.end())
+					throw ToolError(400, "mouse 'button' must be left, right or middle");
+				json keyed = a_args;
+				keyed["device"] = "keyboard";
+				keyed["key"] = button->second;
+				keyed["action"] = action == "click" ? std::string("tap") : action;
+				json result = HandleInputImpl(keyed, a_ctx);
+				result["device"] = "mouse";
+				return result;
+			}
 			if (device != "keyboard")
-				throw ToolError(400, "input contract v2 supports device='keyboard' or device='vrTrackedSet'");
+				throw ToolError(400, "input contract v2 supports device='keyboard', 'mouse' or 'vrTrackedSet'");
 			if (action == "status")
 				return KeyboardManager::Get().Status();
 
@@ -807,7 +849,10 @@ namespace dvb
 		input.description =
 			"Versioned synthetic input interface. action='capabilities' (default) returns the exact "
 			"contract/version, readiness, limits, injection path, supported actions, and complete "
-			"keyboard name→DirectInput-scan-code catalog; clients MUST capability-negotiate rather "
+			"keyboard name→DirectInput-scan-code catalog (plus mouseLeft/mouseRight/mouseMiddle, codes 256-258, injected as "
+			"mouse button events; each key lists its codeDomain, engineDevice and engineId, and mouseLeft is the left mouse "
+			"button, which is attack only under the default bindings and outside menus); "
+			"clients MUST capability-negotiate rather "
 			"than assuming this tool exists. Contract v1 implements device='keyboard' using Skyrim's "
 			"own BSInputEventQueue (not Windows SendInput, so window focus is irrelevant). 'status' "
 			"reports readiness and every synthetic held key with owner/lease timing. 'down' starts a "
@@ -833,13 +878,27 @@ namespace dvb
 			"retryable through that token. Ad-hoc sequences stop on lifecycle boundaries; recording replay "
 			"may explicitly survive the load/new-game events it is reproducing. There are deliberately no per-device or "
 			"per-button VR mutation actions: submit the coherent tracked set so poses and controls cannot "
-			"come from different clocks.";
+			"come from different clocks. device='mouse': 'move' (x, y in game-window client pixels) sets the engine's menu cursor "
+			"and, with focusWindow=true, brings the game window to the foreground and sets the OS cursor so overlays that read it "
+			"(ImGui) see the pointer; 'down'/'up'/'tap'/'click' (button left|right|middle, default left) press through the same "
+			"engine input queue as the keyboard; 'status' reports the cursors and window focus. device='vrTrackedSet' action='reach' places one or both hands next to nodes of the player: "
+			"it calibrates how a tracking-space move shows up in the world, injects the tracked set, re-reads the hand and "
+			"target nodes after each settle (the body follows the arms, so a node moves when a hand reaches it) and corrects "
+			"until every hand is within toleranceUnits, then holds holdMs; 'head' optionally aims the HMD at the hands or a "
+			"node. It returns { queued, runId } at once; action='reachStatus' (runId) reports { phase (queued | calibrating | "
+			"reaching | holding | done | failed | stopped), iteration, worstErrorDistance, per hand { hand, node, error, errorDistance, handToNode }, "
+			"error, active, stopping (a stop was requested and the run is still releasing) }, and 'reachStop' ends it. One reach runs at a time (409); while it runs it replaces the HMD and both "
+			"controllers like a sequence, and it ends at a load. Fingers are not driven.";
 		input.inputSchema = json{
 			{ "type", "object" },
 			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "observe", "down", "up", "tap", "sequence", "stop", "releaseAll" }) } } },
-								{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard", "vrTrackedSet" }) }, { "description", "mutation/status device; omit for capabilities" } } },
-								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 255 } } }) }, { "description", "down/up/tap: documented key name or raw DirectInput scancode" } } },
+								{ "action", json{ { "type", "string" }, { "enum", json::array({ "capabilities", "status", "observe", "down", "up", "tap", "click", "move", "sequence", "stop", "releaseAll", "reach", "reachStatus", "reachStop" }) } } },
+								{ "device", json{ { "type", "string" }, { "enum", json::array({ "keyboard", "mouse", "vrTrackedSet" }) }, { "description", "mutation/status device; omit for capabilities" } } },
+								{ "x", json{ { "type", "number" }, { "description", "mouse move: client-pixel x" } } },
+								{ "y", json{ { "type", "number" }, { "description", "mouse move: client-pixel y" } } },
+								{ "button", json{ { "type", "string" }, { "enum", json::array({ "left", "right", "middle" }) }, { "description", "mouse down/up/tap/click: button (default left)" } } },
+								{ "focusWindow", json{ { "type", "boolean" }, { "description", "mouse move: bring the game window to the foreground and set the OS cursor too (default false)" } } },
+								{ "key", json{ { "oneOf", json::array({ json{ { "type", "string" } }, json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 258 } } }) }, { "description", "down/up/tap: documented key name, raw DirectInput scancode (1-255), or mouse button code (256-258 = mouseLeft / mouseRight / mouseMiddle)" } } },
 								{ "owner", json{ { "type", "string" }, { "minLength", 1 }, { "maxLength", 128 }, { "description", "stable task/session owner; defaults to MCP session id or rest:anonymous" } } },
 								{ "durationMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 5000 }, { "description", "tap duration (default 50); sequence tap/wait event duration" } } },
 								{ "maxHoldMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", kMaximumMaxHoldMs }, { "description", "down safety lease (default 5000); automatic up at expiry" } } },
@@ -850,6 +909,13 @@ namespace dvb
 								{ "tailMs", json{ { "type", "integer" }, { "minimum", 10 }, { "maximum", 1000 }, { "description", "vrTrackedSet sequence: final-state visibility before automatic release (default 50ms)" } } },
 								{ "controlToken", json{ { "type", "string" }, { "description", "vrTrackedSet stop/releaseAll: opaque token returned by sequence start" } } },
 								{ "surviveLifecycle", json{ { "type", "boolean" }, { "description", "internal recording replay only; external true is rejected" } } },
+								{ "hands", json{ { "type", "object" }, { "description", "reach: {left?:{node,front?,offset?:[x,y,z]}, right?:{...}} - put that hand node-relative: next to a node of the player, front world units in front of it along the facing, plus a world offset; at least one hand" } } },
+								{ "head", json{ { "type", "object" }, { "description", "reach: {lookAt:'hands'|<node name>, back?:0.5, up?:0.3, pos?:[x,y,z], eyeHeight?} - aim the HMD at the hands or a node from back meters behind and up meters above it (tracking space), or from pos; eyeHeight (0..3) sets the head's height in tracking meters, e.g. 1.6 to frame low targets from standing height" } } },
+								{ "holdMs", json{ { "type", "integer" }, { "minimum", 100 }, { "maximum", 1798000 }, { "description", "reach: how long to hold the final pose (default 10000)" } } },
+								{ "iterations", json{ { "type", "integer" }, { "minimum", 1 }, { "maximum", 10 }, { "description", "reach: correction passes (default 4)" } } },
+								{ "toleranceUnits", json{ { "type", "number" }, { "minimum", 0.05 }, { "maximum", 50 }, { "description", "reach: converged when each hand is within this many world units of its target (default 1)" } } },
+								{ "approachUnits", json{ { "type", "number" }, { "minimum", 0 }, { "maximum", 200 }, { "description", "reach: world units behind the target, along the facing, the first approach starts from (default 15)" } } },
+								{ "runId", json{ { "type", "integer" }, { "minimum", 1 }, { "description", "reachStatus: the run (default the latest)" } } },
 							} },
 		};
 		a_registry.Register(std::move(input), &HandleInput);

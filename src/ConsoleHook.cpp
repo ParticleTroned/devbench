@@ -2,6 +2,7 @@
 
 #include "ConsoleLogCapture.h"
 #include "EventBus.h"
+#include "GameText.h"
 #include "Json.h"
 #include "Recording.h"
 
@@ -34,12 +35,10 @@ namespace dvb::ConsoleHook
 						const char* cmd = v.GetString();
 						// Skip devbench's own capture fences (ConsoleLogCapture) so they don't
 						// pollute events or recordings.
-						if (cmd && *cmd &&
-							std::strcmp(cmd, ConsoleLogCapture::kMarkerBegin) != 0 &&
-							std::strcmp(cmd, ConsoleLogCapture::kMarkerEnd) != 0) {
+						if (cmd && *cmd && !ConsoleLogCapture::IsFenceCommand(cmd)) {
 							if (g_events)
-								g_events->Publish("console.command", json{ { "command", cmd } });
-							Recording::NoteConsoleCommand(cmd);
+								g_events->Publish("console.command", json{ { "command", FromGame(cmd) } });
+							Recording::NoteConsoleCommand(FromGame(cmd));
 						}
 					}
 				}
