@@ -1,4 +1,5 @@
 #include "EventBus.h"
+#include "MainThread.h"
 #include "McpAdapter.h"
 #include "ToolRegistry.h"
 #include "test_framework.h"
@@ -122,6 +123,35 @@ namespace
 			return;
 		CHECK(message.at("method") == "notifications/tools/list_changed");
 		CHECK(!message.contains("id"));
+	}
+}
+
+TEST_CASE("MCP preserves task timeout outcomes on the HTTP transport")
+{
+	Fixture fixture;
+	fixture.registry.Register({ "timeout", "Timeout outcome" }, [](const json& args, const auto&) -> json {
+		throw dvb::MainThread::TaskTimeout(args.at("started").get<bool>(), "Main-thread task timed out");
+	});
+	const auto session = fixture.Connect();
+	for (bool started : { false, true }) {
+		const json request{ { "jsonrpc", "2.0" }, { "id", ++fixture.requestId }, { "method", "tools/call" },
+			{ "params", { { "name", "timeout" }, { "arguments", { { "started", started } } } } } };
+		const auto response = fixture.client.Post("/mcp", Fixture::Headers(session), request.dump(), "application/json");
+		CHECK(response && response->status == 200);
+		if (!response || response->status != 200)
+			continue;
+		const auto result = json::parse(response->body).at("result");
+		CHECK(result.at("isError") == true);
+		const auto text = result.at("content").at(0).at("text").get<std::string>();
+		const auto begin = text.find('{');
+		CHECK(begin != std::string::npos);
+		if (begin == std::string::npos)
+			continue;
+		const auto error = json::parse(text.substr(begin));
+		CHECK(error.at("code") == 504);
+		CHECK(error.at("details").at("taskStarted") == started);
+		CHECK(error.at("details").at("retrySafe") == !started);
+		CHECK(error.at("details").at("outcome") == (started ? "unknown" : "not_started"));
 	}
 }
 

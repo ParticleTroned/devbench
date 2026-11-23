@@ -3,6 +3,7 @@
 
 #include "EventBus.h"
 #include "Json.h"
+#include "ModalWatch.h"
 #include "Recording.h"
 
 #include <atomic>
@@ -40,6 +41,7 @@ namespace dvb
 					if (g_bus)
 						g_bus->Publish("menu", json{ { "name", name }, { "opening", a_event->opening } });
 					Recording::NoteMenuState(name, a_event->opening);
+					ModalWatch::OnMenuEvent(name, a_event->opening);
 				}
 				return RE::BSEventNotifyControl::kContinue;
 			}

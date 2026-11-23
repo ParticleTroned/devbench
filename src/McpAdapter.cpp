@@ -38,7 +38,7 @@ namespace dvb
 				// text content array); returning an {isError,...} object here would land
 				// inside "content" as a non-array and break the same validation. cpp-mcp
 				// only surfaces what(), so fold the status code into the message.
-				throw std::runtime_error("[" + std::to_string(r.errorCode) + "] " + (r.errorDetails.empty() ? r.errorMessage : r.ErrorJson().dump()));
+				throw std::runtime_error("[" + std::to_string(r.errorCode) + "] " + (r.errorDetails.empty() ? Utf8Scrub(r.errorMessage) : Dump(r.ErrorJson())));
 			});
 
 			// A tool was added or replaced (e.g. a mod registered an inspect kind / menu, which also

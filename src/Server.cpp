@@ -289,7 +289,7 @@ namespace dvb
 		const bool        vr = REL::Module::IsVR();
 		const std::string game = vr ? "vr" : "se";
 		std::error_code   ec;
-		const std::string exePath = std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec).string();
+		const std::string exePath = Utf8(std::filesystem::absolute("Data/SKSE/Plugins/devbench/devbench-bridge.exe", ec));
 		const std::string name = "devbench-" + game;
 		json              result{
 			{ "exePath", exePath },
@@ -306,7 +306,7 @@ namespace dvb
 				"are also mirrored to externalStateDir, which isn't virtualized, for exactly that reason." },
 		};
 		if (auto dir = ExternalStateDir())
-			result["externalStateDir"] = dir->string();
+			result["externalStateDir"] = Utf8(*dir);
 		return result;
 	}
 }

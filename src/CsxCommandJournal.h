@@ -36,9 +36,9 @@ namespace dvb
 			if (mutation)
 				if (const auto receipt = Find(build, request))
 					return *receipt;
-			auto result = run();
+			auto       result = run();
 			const bool retryableFailure = result.is_object() && result.contains("error") && result["error"].is_object() &&
-				!result.value("ok", true) && result["error"].value("retryable", false);
+			                              !result.value("ok", true) && result["error"].value("retryable", false);
 			if (mutation && !retryableFailure)
 				Remember(build, request, result);
 			return result;
@@ -48,7 +48,7 @@ namespace dvb
 		struct Receipt
 		{
 			std::string build;
-			json request, result;
+			json        request, result;
 		};
 		std::deque<Receipt> receipts;
 	};

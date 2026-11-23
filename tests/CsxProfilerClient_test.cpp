@@ -190,11 +190,11 @@ TEST_CASE("screenshot admission waits for encoding and publication and fails clo
 TEST_CASE("retained CSX commands replay before fresh-work admission")
 {
 	dvb::CsxCommandJournal journal;
-	auto request = Request("capture");
-	int admitted = 0;
-	const auto run = [&]() -> json { ++admitted; return { { "ok", true }, { "requestId", "capture-1" } }; };
-	const auto first = journal.Dispatch("build", request, true, run);
-	const auto busy = []() -> json { throw dvb::ToolError(409, "busy"); };
+	auto                   request = Request("capture");
+	int                    admitted = 0;
+	const auto             run = [&]() -> json { ++admitted; return { { "ok", true }, { "requestId", "capture-1" } }; };
+	const auto             first = journal.Dispatch("build", request, true, run);
+	const auto             busy = []() -> json { throw dvb::ToolError(409, "busy"); };
 	CHECK(journal.Dispatch("build", request, true, busy) == first);
 	CHECK(admitted == 1);
 	auto changed = request;
@@ -204,7 +204,7 @@ TEST_CASE("retained CSX commands replay before fresh-work admission")
 	changed["commandId"] = "new";
 	CHECK_THROWS(journal.Dispatch("build", changed, true, busy));
 	CHECK_THROWS(journal.Dispatch("different-build", request, true, busy));
-	int attempts = 0;
+	int        attempts = 0;
 	const auto transient = [&]() -> json { ++attempts; return { { "ok", false }, { "error", { { "retryable", true } } } }; };
 	journal.Dispatch("build", changed, true, transient);
 	journal.Dispatch("build", changed, true, transient);
@@ -213,9 +213,9 @@ TEST_CASE("retained CSX commands replay before fresh-work admission")
 
 TEST_CASE("profiler receipt lookup precedes admission callback")
 {
-	Fake fake;
+	Fake                   fake;
 	dvb::CsxProfilerClient client;
-	auto request = Request("start_capture");
+	auto                   request = Request("start_capture");
 	request["frameCount"] = 20;
 	const auto first = client.Dispatch(fake.api, request, "build");
 	const auto busy = [] { throw dvb::ToolError(409, "screenshot busy"); };

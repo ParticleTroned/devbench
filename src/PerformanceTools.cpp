@@ -123,8 +123,9 @@ namespace dvb
 		{
 			const auto schema = descriptor.inputSchema;
 			registry.Register(std::move(descriptor), [schema, handler = std::move(handler)](const json& args, const ToolContext& context) {
-				PerformanceToolPolicy::Validate(schema, args);
-				return handler(args, context);
+				const auto& request = context.rawArgs ? *context.rawArgs : args;
+				PerformanceToolPolicy::Validate(schema, request);
+				return handler(request, context);
 			});
 		}
 	}
@@ -146,7 +147,7 @@ namespace dvb
 	void RegisterPerformanceTools(ToolRegistry& registry, ToolDescriptor game, ToolHandler gameHandler,
 		ToolDescriptor inspect, ToolHandler inspectHandler)
 	{
-		game.description = "Performance profile: list saves, load a named save or loadLast. Loads are asynchronous; inspect state and scene for completion. Loads reject active measurements, profiler captures and screenshot work. Other game actions are unavailable.";
+		game.description = "Performance profile: list saves, load a named save or loadLast. Loads are asynchronous; inspect state and scene for completion. Loads reject active measurements, profiler captures and screenshot work. A main-thread timeout includes details.taskStarted, details.outcome and details.retrySafe; never retry a load when taskStarted is true because it can still complete. Other game actions are unavailable.";
 		auto& gameSchema = game.inputSchema;
 		gameSchema["properties"]["limit"]["minimum"] = 1;
 		gameSchema["properties"]["limit"]["maximum"] = 1000;
@@ -154,7 +155,10 @@ namespace dvb
 		gameSchema["required"] = { "action" };
 		gameSchema["properties"]["action"]["enum"] = { "list", "load", "loadLast" };
 		gameSchema["properties"]["action"]["description"] = "list | load | loadLast";
-		for (const auto* key : { "hours", "scale", "holdMs", "freeze", "allowHigh", "allowTimeScale" }) gameSchema["properties"].erase(key);
+		json properties = json::object();
+		for (const auto* key : { "action", "name", "dir", "filter", "limit", "detail" })
+			properties[key] = gameSchema["properties"].at(key);
+		gameSchema["properties"] = std::move(properties);
 		RegisterRestricted(registry, std::move(game), [gameHandler](const json& args, const ToolContext& context) {
 			if (args.at("action") != "list" && (args.contains("dir") || args.contains("filter") || args.contains("limit") || args.contains("detail")))
 				throw ToolError(400, "dir, filter, limit and detail apply only to save listing");
@@ -176,7 +180,8 @@ namespace dvb
 
 		const auto profilerSchema = PerformanceToolPolicy::ProfilerSchema();
 		registry.Register({ "communityshaders.profiler_api", "Production CSX profiler API: explicitly set_enabled, start_capture (1-300 frames), poll capture_status and page capture_export (up to 128 timers). Only the capture owner can cancel. Reuse commandId only for identical mutation retries; 64 receipts retained. Quality reports invalid CPU/GPU frames. No automatic background polling.", profilerSchema, false },
-			[](const json& args, const ToolContext&) {
+			[](const json& normalized, const ToolContext& context) {
+				const auto& args = context.rawArgs ? *context.rawArgs : normalized;
 				PerformanceToolPolicy::ValidateProfiler(args);
 				return MainThread::RunAndWait([args] {
 					const auto& performance = ProductionApi();
@@ -186,22 +191,23 @@ namespace dvb
 					const auto&              api = Query<ProfilerAPI::Interface003>(ProfilerAPI::ServiceName, ProfilerAPI::QualityServiceMinor);
 					static CsxProfilerClient client;
 					auto                     result = client.Dispatch(api, args, producer.at("buildId").get<std::string>(), [&] {
-					if (action == "set_enabled" || action == "clear_history" || action == "start_capture") {
-						RequireIdle(performance);
-						RequireScreenshotIdle();
-					}
+						if (action == "set_enabled" || action == "clear_history" || action == "start_capture") {
+							RequireIdle(performance);
+							RequireScreenshotIdle();
+						}
 					});
 					return json{ { "ok", true }, { "producer", std::move(producer) }, { "result", std::move(result) } };
 				});
 			});
 		// The native services enforce their domain schemas and retain mutation receipts.
 		registry.Register({ "communityshaders.performance_tuning", "Production CSX performance controls and saved results. Uses the CSX API contract; requests require contractMajor=1, clientId, commandId and action. Scan batches run three scans with ten-second gaps and automatic export; recordFpsVR is optional. Export actions require an explicit directory.", PerformanceSchema(), false },
-			[](const json& args, const ToolContext&) {
+			[](const json& normalized, const ToolContext& context) {
+				const auto& args = context.rawArgs ? *context.rawArgs : normalized;
 				PerformanceToolPolicy::Validate(PerformanceSchema(), args);
 				return MainThread::RunAndWait([args] {
-					const auto& api = ProductionApi();
-					const auto producer = Producer(args);
-					const auto action = args.at("action").get<std::string_view>();
+					const auto&              api = ProductionApi();
+					const auto               producer = Producer(args);
+					const auto               action = args.at("action").get<std::string_view>();
 					static CsxCommandJournal journal;
 					return journal.Dispatch(producer.at("buildId").get<std::string>(), args, action != "status" && action != "results_status", [&] {
 						if (action.starts_with("start_") || action == "set_feature_enabled")
@@ -211,18 +217,19 @@ namespace dvb
 				});
 			});
 		registry.Register({ "communityshaders.screenshot", "Production CSX asynchronous screenshot API. Rejects capture and sequence_start during measurements or profiler captures; poll request_get for terminal artifact status. Native CSX validates requests and owns encoding, cancellation and receipts.", ScreenshotSchema(), false },
-			[](const json& args, const ToolContext&) {
+			[](const json& normalized, const ToolContext& context) {
+				const auto& args = context.rawArgs ? *context.rawArgs : normalized;
 				if (!args.is_object() || !args.contains("action") || !args["action"].is_string())
 					throw ToolError(400, "Invalid screenshot request");
 				for (const auto* key : { "clientId", "commandId" })
 					if (!args.contains(key) || !args[key].is_string() || args[key].get_ref<const std::string&>().empty() || args[key].get_ref<const std::string&>().size() > 128)
 						throw ToolError(400, "Bounded clientId and commandId strings are required");
 				return MainThread::RunAndWait([args] {
-					const auto& performance = ProductionApi();
-					const auto producer = Producer(args);
-					const auto action = args.at("action").get<std::string_view>();
-					const bool mutation = action != "capabilities" && action != "status" && action != "settings_get" && action != "settings_validate" &&
-						action != "request_get" && action != "request_list" && action != "events_poll";
+					const auto&              performance = ProductionApi();
+					const auto               producer = Producer(args);
+					const auto               action = args.at("action").get<std::string_view>();
+					const bool               mutation = action != "capabilities" && action != "status" && action != "settings_get" && action != "settings_validate" &&
+					                                    action != "request_get" && action != "request_list" && action != "events_poll";
 					static CsxCommandJournal journal;
 					return journal.Dispatch(producer.at("buildId").get<std::string>(), args, mutation, [&] {
 						if (action == "capture" || action == "sequence_start") {

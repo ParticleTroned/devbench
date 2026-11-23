@@ -1,8 +1,8 @@
 #pragma once
 
 #include "CSX/CSprofilerapi.h"
-#include "ToolRegistry.h"
 #include "CsxCommandJournal.h"
+#include "ToolRegistry.h"
 #include <functional>
 
 namespace dvb
@@ -15,7 +15,7 @@ namespace dvb
 
 	private:
 		CsxCommandJournal journal;
-		std::string         owner, ownerBuild;
-		std::uint64_t       ownedCapture = 0;
+		std::string       owner, ownerBuild;
+		std::uint64_t     ownedCapture = 0;
 	};
 }
