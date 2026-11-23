@@ -41,7 +41,16 @@ class CapabilityClient:
                     "encoding": "DirectInputScanCode",
                     "injection": "Skyrim.BSInputEventQueue",
                     "actions": ["status", "down", "up", "tap", "sequence", "releaseAll"],
-                    "keys": [{"key": "enter", "scancode": 0x1C}],
+                    "keys": [
+                        {"key": "enter", "scancode": 0x1C,
+                         "codeDomain": "directInputScanCode", "engineDevice": "keyboard", "engineId": 0x1C},
+                        {"key": "mouseLeft", "scancode": 0x100,
+                         "codeDomain": "mouseButton", "engineDevice": "mouse", "engineId": 0},
+                        {"key": "mouseRight", "scancode": 0x101,
+                         "codeDomain": "mouseButton", "engineDevice": "mouse", "engineId": 1},
+                        {"key": "mouseMiddle", "scancode": 0x102,
+                         "codeDomain": "mouseButton", "engineDevice": "mouse", "engineId": 2},
+                    ],
                 },
                 "vrTrackedSet": {
                     "atomicDevices": ["hmd", "left", "right"],
