@@ -1,8 +1,11 @@
 #include "VRInput.h"
 
+#include "ReachControl.h"
+
 #include "EventBus.h"
 #include "MainThread.h"
 #include "ToolRegistry.h"
+#include "VRControllerProps.h"
 #include "VRInputState.h"
 
 #include <algorithm>
@@ -42,6 +45,8 @@ namespace dvb
 		constexpr std::size_t kIVRSystemGetControllerRoleForTrackedDeviceIndexSlot = 19;
 		constexpr std::size_t kIVRSystemGetTrackedDeviceClassSlot = 20;
 		constexpr std::size_t kIVRSystemIsTrackedDeviceConnectedSlot = 21;
+		constexpr std::size_t kIVRSystemGetInt32TrackedDevicePropertySlot = 24;
+		constexpr std::size_t kIVRSystemGetUint64TrackedDevicePropertySlot = 25;
 		constexpr std::size_t kIVRSystemGetControllerStateSlot = 34;
 		constexpr std::size_t kIVRSystemGetControllerStateWithPoseSlot = 35;
 
@@ -619,13 +624,20 @@ namespace dvb
 			vr::TrackedDeviceIndex_t, vr::VRControllerState_t*, std::uint32_t,
 			vr::TrackedDevicePose_t*);
 
-		REL::Relocation<WaitGetPosesFn>        g_waitGetPoses;
-		REL::Relocation<WaitGetPosesFn>        g_getLastPoses;
-		REL::Relocation<GetTrackingPoseFn>     g_getTrackingPose;
-		REL::Relocation<RoleIndexFn>           g_roleIndex;
-		REL::Relocation<IndexRoleFn>           g_indexRole;
-		REL::Relocation<DeviceClassFn>         g_deviceClass;
-		REL::Relocation<ConnectedFn>           g_connected;
+		REL::Relocation<WaitGetPosesFn>    g_waitGetPoses;
+		REL::Relocation<WaitGetPosesFn>    g_getLastPoses;
+		REL::Relocation<GetTrackingPoseFn> g_getTrackingPose;
+		REL::Relocation<RoleIndexFn>       g_roleIndex;
+		REL::Relocation<IndexRoleFn>       g_indexRole;
+		REL::Relocation<DeviceClassFn>     g_deviceClass;
+		REL::Relocation<ConnectedFn>       g_connected;
+		using Int32PropertyFn = std::int32_t (*)(vr::IVRSystem*, vr::TrackedDeviceIndex_t,
+			vr::ETrackedDeviceProperty, vr::ETrackedPropertyError*);
+		using Uint64PropertyFn = std::uint64_t (*)(vr::IVRSystem*, vr::TrackedDeviceIndex_t,
+			vr::ETrackedDeviceProperty, vr::ETrackedPropertyError*);
+
+		REL::Relocation<Int32PropertyFn>       g_int32Property;
+		REL::Relocation<Uint64PropertyFn>      g_uint64Property;
 		REL::Relocation<ControllerStateFn>     g_controllerState;
 		REL::Relocation<ControllerStatePoseFn> g_controllerStatePose;
 
@@ -792,6 +804,56 @@ namespace dvb
 			return g_connected(a_self, a_index);
 		}
 
+		std::mutex                       g_recentMutex;
+		VRControllerProps::RecentIndices g_recentIndices;
+
+		std::int64_t SteadyNowMs()
+		{
+			return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+		}
+
+		// True for a controller index the active sequence drives, or one it drove within the release grace window.
+		bool IsSyntheticControllerIndex(vr::TrackedDeviceIndex_t a_index)
+		{
+			const auto      frame = VRTrackedSetManager::Get().Current();
+			const auto      now = SteadyNowMs();
+			std::lock_guard lock(g_recentMutex);
+			if (frame) {
+				for (const auto* device : { &frame->left, &frame->right })
+					if (device->pose.available && a_index == device->pose.index) {
+						g_recentIndices.Note(a_index, now);
+						return true;
+					}
+			}
+			return g_recentIndices.Recent(a_index, now);
+		}
+
+		std::int32_t Int32PropertyHook(vr::IVRSystem* a_self, vr::TrackedDeviceIndex_t a_index,
+			vr::ETrackedDeviceProperty a_prop, vr::ETrackedPropertyError* a_error)
+		{
+			const auto prop = static_cast<std::uint32_t>(a_prop);
+			if (prop >= VRControllerProps::kAxis0TypeProp &&
+				prop < VRControllerProps::kAxis0TypeProp + VRControllerProps::kAxisCount &&
+				IsSyntheticControllerIndex(a_index)) {
+				if (a_error)
+					*a_error = vr::TrackedProp_Success;
+				return VRControllerProps::SyntheticAxisType(prop - VRControllerProps::kAxis0TypeProp);
+			}
+			return g_int32Property(a_self, a_index, a_prop, a_error);
+		}
+
+		std::uint64_t Uint64PropertyHook(vr::IVRSystem* a_self, vr::TrackedDeviceIndex_t a_index,
+			vr::ETrackedDeviceProperty a_prop, vr::ETrackedPropertyError* a_error)
+		{
+			if (static_cast<std::uint32_t>(a_prop) == VRControllerProps::kSupportedButtonsProp &&
+				IsSyntheticControllerIndex(a_index)) {
+				if (a_error)
+					*a_error = vr::TrackedProp_Success;
+				return VRControllerProps::kSyntheticSupportedButtons;
+			}
+			return g_uint64Property(a_self, a_index, a_prop, a_error);
+		}
+
 		bool SyntheticController(vr::TrackedDeviceIndex_t a_index, vr::VRControllerState_t* a_state,
 			std::uint32_t a_size, vr::TrackedDevicePose_t* a_pose)
 		{
@@ -854,6 +916,8 @@ namespace dvb
 			g_indexRole = systemVtable.write_vfunc(kIVRSystemGetControllerRoleForTrackedDeviceIndexSlot, IndexRoleHook);
 			g_deviceClass = systemVtable.write_vfunc(kIVRSystemGetTrackedDeviceClassSlot, DeviceClassHook);
 			g_connected = systemVtable.write_vfunc(kIVRSystemIsTrackedDeviceConnectedSlot, ConnectedHook);
+			g_int32Property = systemVtable.write_vfunc(kIVRSystemGetInt32TrackedDevicePropertySlot, Int32PropertyHook);
+			g_uint64Property = systemVtable.write_vfunc(kIVRSystemGetUint64TrackedDevicePropertySlot, Uint64PropertyHook);
 			g_controllerState = systemVtable.write_vfunc(kIVRSystemGetControllerStateSlot, ControllerStateHook);
 			g_controllerStatePose = systemVtable.write_vfunc(kIVRSystemGetControllerStateWithPoseSlot, ControllerStatePoseHook);
 			return true;
@@ -899,9 +963,15 @@ namespace dvb
 				return VRTrackedSetManager::Get().Status();
 			if (action == "observe")
 				return ObservePhysicalTrackedSet();
+			if (action == "reachStatus")
+				return ReachControl::Status(a_args);
 			const std::string owner = ResolveOwner(a_args, a_ctx);
 			if (action == "sequence")
 				return VRTrackedSetManager::Get().Start(a_args, owner, a_ctx.internal);
+			if (action == "reach")
+				return ReachControl::Start(a_args, owner, a_ctx);
+			if (action == "reachStop")
+				return ReachControl::Stop(owner);
 			if (action == "stop" || action == "releaseAll") {
 				if (a_args.contains("controlToken") && !a_args["controlToken"].is_string())
 					throw ToolError(400, "'controlToken' must be a string");
@@ -910,7 +980,7 @@ namespace dvb
 					a_ctx.internal,
 					action == "releaseAll" ? "releaseAll" : "request");
 			}
-			throw ToolError(400, std::format("unknown vrTrackedSet action '{}' (status|observe|sequence|stop|releaseAll)", action));
+			throw ToolError(400, std::format("unknown vrTrackedSet action '{}' (status|observe|sequence|stop|releaseAll|reach|reachStatus|reachStop)", action));
 		} catch (const json::exception& e) {
 			throw ToolError(400, std::format("invalid VR tracked-set JSON: {}", e.what()));
 		}
@@ -931,6 +1001,7 @@ namespace dvb
 	{
 		if (!g_vrReady.load(std::memory_order_relaxed))
 			return;
+		ReachControl::EndSession();
 		const std::string reason = a_reason ? a_reason : "lifecycle";
 		try {
 			VRTrackedSetManager::Get().StopForLifecycle(reason);

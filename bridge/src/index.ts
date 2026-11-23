@@ -9,6 +9,11 @@ import {
 import { callTool, GameUnavailableError, listTools } from "./proxy.js";
 import { isSupportedGame, resolveTarget } from "./runtime.js";
 import { printSetupSnippet } from "./setup.js";
+import {
+  isUnknownToolError,
+  parseBridgeArgs,
+  RestCallError,
+} from "./rest-policy.js";
 import toolsFallback from "./tools-fallback.json" with { type: "json" };
 
 interface DevbenchTool {
@@ -35,32 +40,10 @@ function isCompiledExecutable(): boolean {
   return process.argv[1]?.includes("~BUN") ?? false;
 }
 
-function parseArgs(argv: string[]): {
-  game?: string;
-  install?: string;
-  setup: boolean;
-} {
-  let game: string | undefined;
-  let install: string | undefined;
-  let setup = false;
-  for (let i = 0; i < argv.length; i++) {
-    switch (argv[i]) {
-      case "--game":
-        game = argv[++i];
-        break;
-      case "--install":
-        install = argv[++i];
-        break;
-      case "setup":
-        setup = true;
-        break;
-    }
-  }
-  return { game, install, setup };
-}
-
 async function main(): Promise<void> {
-  const args = parseArgs(process.argv.slice(2));
+  const args = parseBridgeArgs(process.argv.slice(2));
+  for (const arg of args.unknown)
+    console.error(`devbench-bridge: ignoring unknown argument: ${arg}`);
 
   if (args.setup) {
     if (!args.install && !isSupportedGame(args.game)) {
@@ -77,18 +60,40 @@ async function main(): Promise<void> {
 
   const server = new Server(
     { name: "devbench-bridge", version: "0.1.0" },
-    { capabilities: { tools: {} } },
+    { capabilities: { tools: { listChanged: true } } },
   );
+
+  let advertised = "";
+  const signatureOf = (tools: DevbenchTool[]): string =>
+    JSON.stringify(
+      tools.map(toMcpTool).sort((a, b) => a.name.localeCompare(b.name)),
+    );
+
+  const notifyIfToolListChanged = async (): Promise<void> => {
+    try {
+      if (signatureOf(await listTools(target)) !== advertised) {
+        await server.sendToolListChanged();
+      }
+    } catch (e) {
+      if (!(e instanceof GameUnavailableError)) {
+        console.error(
+          `devbench-bridge: tools/list_changed check failed: ${(e as Error).message}`,
+        );
+      }
+    }
+  };
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     try {
       const tools = await listTools(target);
+      advertised = signatureOf(tools);
       return { tools: tools.map(toMcpTool) };
     } catch (e) {
       if (e instanceof GameUnavailableError) {
         // A not-yet-running game reports the static fallback, not an empty list --
         // a client typically fetches tools/list only once per session. A call still
         // fails live with GameUnavailableError's own message.
+        advertised = signatureOf(toolsFallback.tools);
         return { tools: toolsFallback.tools.map(toMcpTool) };
       }
       throw e;
@@ -101,6 +106,7 @@ async function main(): Promise<void> {
         target,
         request.params.name,
         request.params.arguments ?? {},
+        args.restTimeoutMs,
       );
       return {
         content: [{ type: "text", text: JSON.stringify(result ?? null) }],
@@ -110,11 +116,21 @@ async function main(): Promise<void> {
         e instanceof GameUnavailableError
           ? `game not running (target: ${target.label})`
           : (e as Error).message;
+      // The game restarted (or a provider plugin did not load) since the client
+      // fetched tools/list, so it still advertises a tool this game lacks: tell it
+      // to fetch the list again.
+      if (isUnknownToolError(e)) {
+        void notifyIfToolListChanged();
+      }
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify({ ok: false, reason: message }),
+            text: JSON.stringify({
+              ok: false,
+              reason: message,
+              ...(e instanceof RestCallError ? { restError: e.details() } : {}),
+            }),
           },
         ],
         isError: true,
