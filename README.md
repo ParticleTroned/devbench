@@ -74,8 +74,15 @@ or render hooks are used.
 Every CSX tool request uses `contractMajor: 1`, `clientId`, `commandId` and
 `action`. Use a stable client ID, a new command ID per mutation and the same
 command ID for an identical retry. The profiler retains the last 64 mutation
-receipts. Native services own their own bounded receipts. Optional
+receipts. Native services own their own bounded receipts. Profiler mutation receipts
+survive unavailable follow-up quality reads; unavailable quality is reported
+explicitly and never counts as complete. Optional
 `expectedBuildId` pins the CSX producer for profiler and performance calls.
+
+Save-load admission and dispatch run in the same main-thread task. Loads and
+new measurements reject outstanding screenshot acquisition, encoding and
+publication. Screenshot starts reject active measurements and bounded
+profiler captures. These checks run only on explicit requests.
 
 Load a fixed save, wait for its `postLoadGame` lifecycle event, verify
 `inspect` state/scene, and let rendering and shader compilation settle.
@@ -625,8 +632,9 @@ interface is shared), so **namespace your topics** the way you namespace tool na
 
 devbench publishes semantic **`EventBus` events** — `record.started`/`record.stopped`,
 `scene.cellLoaded`, `menu`, `lifecycle`, and `health.stalled`/`health.resumed` — so a client can align a capture to those
-boundaries (and the `scenario` tool returns per-step timings synchronously) — but devbench does
-not collect or serve profiling data itself.
+boundaries (and the `scenario` tool returns per-step timings synchronously) — but the full profile does
+not collect or serve profiling data itself. The optional performance profile
+serves CSX's public profiler API without adding a sampling loop.
 Frametime and GPU metrics are left to dedicated clients: pair devbench with a Tracy-instrumented
 mod (using the `tracy` MCP) or any other profiler to annotate captures with what the bench was
 doing.

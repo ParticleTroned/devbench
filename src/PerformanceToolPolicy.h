@@ -1,9 +1,32 @@
 #pragma once
 #include "ToolRegistry.h"
+#include <algorithm>
 #include <cmath>
+#include <initializer_list>
 
 namespace dvb::PerformanceToolPolicy
 {
+	/** Measurement admission includes asynchronous encoding and artifact publication. */
+	inline void RequireScreenshotIdle(const json& response)
+	{
+		const auto busy = [] { throw ToolError(409, "CSX screenshot work is active or not ready"); };
+		if (!response.is_object() || response.value("ok", false) != true || !response.contains("result"))
+			busy();
+		const auto& result = response.at("result");
+		const auto  requireZero = [&](const char* group, std::initializer_list<const char*> fields) {
+			if (!result.contains(group) || !result[group].is_object())
+				busy();
+			for (const auto* field : fields)
+				if (!result[group].contains(field) || result[group][field] != 0)
+					busy();
+		};
+		requireZero("dispatcher", { "pendingOperations", "queuedManualCaptures", "queuedSequenceFrames", "activeSequences" });
+		requireZero("worker", { "outstandingCaptureJobs" });
+		requireZero("ioWorkers", { "destinationPreparationOutstanding", "manifestPublicationOutstanding", "retiredManifestSnapshots" });
+		if (!result["dispatcher"].contains("activeAcquisitionRequestId") || !result["dispatcher"]["activeAcquisitionRequestId"].is_null())
+			busy();
+	}
+
 	/** Enforce flat tool schemas on both REST and MCP before dispatch. */
 	inline void Validate(const json& schema, const json& args)
 	{

@@ -204,5 +204,7 @@ namespace CSX::ProfilerAPI
 	{
 		Interface002 sources;
 		Status (*GetCaptureQuality)(const void* context, std::uint64_t captureId, CaptureQuality001* output) = nullptr;
+		/** Read the latest bounded session, including kNone; independent of continuous profiling. */
+		Status (*GetCurrentCapture)(const void* context, CaptureProgress001* output) = nullptr;
 	};
 }

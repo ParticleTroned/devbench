@@ -97,6 +97,28 @@ namespace dvb
 				throw ToolError(409, "CSX measurement is active or not ready");
 		}
 
+		const ScreenshotAPI::Interface001& ScreenshotApi()
+		{
+			const auto& api = Query<ScreenshotAPI::Interface001>(ScreenshotAPI::ServiceName, 0);
+			if (api.major != 1 || api.minor != 0 || !api.Dispatch)
+				throw ToolError(503, "Incompatible screenshot API");
+			return api;
+		}
+
+		void RequireProfilerIdle()
+		{
+			const auto&                     api = Query<ProfilerAPI::Interface003>(ProfilerAPI::ServiceName, ProfilerAPI::QualityServiceMinor);
+			ProfilerAPI::CaptureProgress001 progress;
+			if (!api.GetCurrentCapture || api.GetCurrentCapture(api.sources.paired.context, &progress) != ProfilerAPI::Status::kSuccess || progress.state == ProfilerAPI::CaptureState::kRunning)
+				throw ToolError(409, "CSX profiler capture is active or not ready");
+		}
+
+		void RequireScreenshotIdle()
+		{
+			const json status{ { "contractMajor", 1 }, { "clientId", "devbench.performance" }, { "commandId", "status" }, { "action", "status" } };
+			PerformanceToolPolicy::RequireScreenshotIdle(Forward<ScreenshotAPI::Request001, ScreenshotAPI::Response001>(ScreenshotApi(), status, ScreenshotAPI::MaximumRequestBytes));
+		}
+
 		void RegisterRestricted(ToolRegistry& registry, ToolDescriptor descriptor, ToolHandler handler)
 		{
 			const auto schema = descriptor.inputSchema;
@@ -107,10 +129,24 @@ namespace dvb
 		}
 	}
 
+	void LoadPerformanceSave(const std::string& name)
+	{
+		MainThread::RunAndWait([name] {
+			RequireIdle(ProductionApi());
+			RequireProfilerIdle();
+			RequireScreenshotIdle();
+			auto* manager = RE::BGSSaveLoadManager::GetSingleton();
+			if (!manager)
+				throw ToolError(503, "Save/load manager is unavailable");
+			manager->Load(name.c_str(), false);
+			return json{};
+		});
+	}
+
 	void RegisterPerformanceTools(ToolRegistry& registry, ToolDescriptor game, ToolHandler gameHandler,
 		ToolDescriptor inspect, ToolHandler inspectHandler)
 	{
-		game.description = "Performance profile: list saves, load a named save or loadLast. Loads are asynchronous; inspect state and scene for completion. Other game actions are unavailable.";
+		game.description = "Performance profile: list saves, load a named save or loadLast. Loads are asynchronous; inspect state and scene for completion. Loads reject active measurements, profiler captures and screenshot work. Other game actions are unavailable.";
 		auto& gameSchema = game.inputSchema;
 		gameSchema["properties"]["limit"]["minimum"] = 1;
 		gameSchema["properties"]["limit"]["maximum"] = 1000;
@@ -124,8 +160,6 @@ namespace dvb
 				throw ToolError(400, "dir, filter, limit and detail apply only to save listing");
 			if (args.at("action") != "load" && args.contains("name"))
 				throw ToolError(400, "name applies only to load");
-			if (args.at("action") != "list")
-				MainThread::RunAndWait([] { RequireIdle(ProductionApi()); return json{}; });
 			return gameHandler(args, context);
 		});
 		inspect.description = "On-demand state, scene, health and registrants for the minimal performance profile. Only SKSE load lifecycle messages are forwarded; no game event sinks or periodic sampling are installed.";
@@ -148,8 +182,10 @@ namespace dvb
 					const auto& performance = ProductionApi();
 					auto        producer = Producer(args);
 					const auto  action = args.at("action").get<std::string_view>();
-					if (action == "set_enabled" || action == "clear_history" || action == "start_capture")
+					if (action == "set_enabled" || action == "clear_history" || action == "start_capture") {
 						RequireIdle(performance);
+						RequireScreenshotIdle();
+					}
 					const auto&              api = Query<ProfilerAPI::Interface003>(ProfilerAPI::ServiceName, ProfilerAPI::QualityServiceMinor);
 					static CsxProfilerClient client;
 					auto                     result = client.Dispatch(api, args, producer.at("buildId").get<std::string>());
@@ -161,20 +197,23 @@ namespace dvb
 			[](const json& args, const ToolContext&) {
 				PerformanceToolPolicy::Validate(PerformanceSchema(), args);
 				return MainThread::RunAndWait([args] { const auto& api = ProductionApi(); Producer(args);
+					const auto action = args.at("action").get<std::string_view>();
+					if (action.starts_with("start_") || action == "set_feature_enabled")
+						RequireScreenshotIdle();
 					return Forward<PerformanceAPI::Request001, PerformanceAPI::Response001>(api, args, PerformanceAPI::MaximumRequestBytes); });
 			});
-		registry.Register({ "communityshaders.screenshot", "Production CSX asynchronous screenshot API. Capture only outside measured windows; poll request_get for terminal artifact status. Native CSX validates requests and owns encoding, cancellation and receipts.", ScreenshotSchema(), false },
+		registry.Register({ "communityshaders.screenshot", "Production CSX asynchronous screenshot API. Rejects capture and sequence_start during measurements or profiler captures; poll request_get for terminal artifact status. Native CSX validates requests and owns encoding, cancellation and receipts.", ScreenshotSchema(), false },
 			[](const json& args, const ToolContext&) {
 				if (!args.is_object() || (args.contains("action") && !args["action"].is_string()))
 					throw ToolError(400, "Invalid screenshot request");
 				return MainThread::RunAndWait([args] {
 					const auto& performance = ProductionApi();
 					Producer(args);
-					if (args.is_object() && (args.value("action", "") == "capture" || args.value("action", "") == "sequence_start"))
+					if (args.is_object() && (args.value("action", "") == "capture" || args.value("action", "") == "sequence_start")) {
 						RequireIdle(performance);
-					const auto& api = Query<ScreenshotAPI::Interface001>(ScreenshotAPI::ServiceName, 0);
-					if (api.major != 1 || api.minor != 0 || !api.Dispatch)
-						throw ToolError(503, "Incompatible screenshot API");
+						RequireProfilerIdle();
+					}
+					const auto& api = ScreenshotApi();
 					return Forward<ScreenshotAPI::Request001, ScreenshotAPI::Response001>(api, args, ScreenshotAPI::MaximumRequestBytes);
 				});
 			});

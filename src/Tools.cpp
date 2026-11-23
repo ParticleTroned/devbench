@@ -361,6 +361,17 @@ namespace dvb
 		// game: programmatic save / load / list. Named saves use SKSE's Game.SaveGame
 		// request; loads use BGSSaveLoadManager. loadLast gives a settled real-save
 		// state for testing WITHOUT coc's heavy new-game init. Both are async — see kLoadNote.
+		void QueueNamedLoad(const std::string& name)
+		{
+			if constexpr (PerformanceProfile)
+				LoadPerformanceSave(name);
+			else
+				SKSE::GetTaskInterface()->AddTask([name] {
+					if (auto* manager = RE::BGSSaveLoadManager::GetSingleton())
+						manager->Load(name.c_str(), false);
+				});
+		}
+
 		json GameHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string{});
@@ -527,10 +538,7 @@ namespace dvb
 				const std::string name = saves.front().name;
 				if constexpr (!PerformanceProfile)
 					Recording::NoteLoadEntry(name);
-				task->AddTask([name]() {
-					if (auto* m = RE::BGSSaveLoadManager::GetSingleton())
-						m->Load(name.c_str(), false);
-				});
+				QueueNamedLoad(name);
 				logs::info("devbench: game loadLast -> '{}'", name);
 				return json{ { "queued", true }, { "action", action }, { "name", name }, { "note", kLoadNote } };
 			}
@@ -556,12 +564,7 @@ namespace dvb
 					// against the main thread's VM lock, so use SKSE's save request.
 					Papyrus::QueueCall(json{ { "script", "Game" }, { "function", "SaveGame" }, { "args", json::array({ name }) } });
 				} else {
-					task->AddTask([name]() {
-						auto* m = RE::BGSSaveLoadManager::GetSingleton();
-						if (!m)
-							return;
-						m->Load(name.c_str(), false);  // checkForMods=false skips the mod-mismatch modal
-					});
+					QueueNamedLoad(name);
 				}
 				logs::info("devbench: game {} '{}'", action, name);
 				json out{ { "queued", true }, { "action", action }, { "name", name } };

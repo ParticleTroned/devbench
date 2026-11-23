@@ -58,7 +58,11 @@ namespace dvb
 		json ProgressJson(const Interface003& api, const CaptureProgress001& progress)
 		{
 			CaptureQuality001 quality;
-			Check(api.GetCaptureQuality(api.sources.paired.context, progress.captureId, &quality));
+			const auto        qualityStatus = api.GetCaptureQuality(api.sources.paired.context, progress.captureId, &quality);
+			if (qualityStatus != Status::kSuccess)
+				return { { "captureId", progress.captureId }, { "state", CaptureStateName(progress.state) },
+					{ "requestedFrames", progress.requestedFrames }, { "submittedFrames", progress.submittedFrames },
+					{ "resolvedFrames", progress.resolvedFrames }, { "quality", { { "available", false }, { "error", StatusName(qualityStatus) }, { "gpuComplete", false }, { "cpuComplete", false } } } };
 			const bool complete = progress.state == CaptureState::kCompleted && progress.requestedFrames != 0 &&
 			                      progress.submittedFrames == progress.requestedFrames && progress.resolvedFrames == progress.requestedFrames;
 			return { { "captureId", progress.captureId }, { "state", CaptureStateName(progress.state) },
@@ -169,7 +173,7 @@ namespace dvb
 		const auto& api = service.sources.paired;
 		if (api.structSize < sizeof(Interface003) || api.major != ServiceMajor || api.minor != QualityServiceMinor ||
 			!api.GetSnapshot || !api.SetEnabled || !api.ClearHistory || !api.StartCapture || !api.GetCaptureProgress ||
-			!api.CancelCapture || !api.GetCaptureTimerCount || !api.GetCaptureTimerDescriptor || !api.GetCaptureHistorySample || !service.GetCaptureQuality)
+			!api.CancelCapture || !api.GetCaptureTimerCount || !api.GetCaptureTimerDescriptor || !api.GetCaptureHistorySample || !service.GetCaptureQuality || !service.GetCurrentCapture)
 			throw ToolError(503, "Incompatible CSX profiler interface");
 		const auto        action = args.at("action").get<std::string>();
 		const bool        mutation = action == "set_enabled" || action == "clear_history" || action == "start_capture" || action == "cancel_capture";
@@ -192,13 +196,13 @@ namespace dvb
 			Check(api.GetCaptureProgress(api.context, args.at("captureId").get<std::uint64_t>(), &progress));
 			result = ProgressJson(service, progress);
 		} else if (mutation) {
-			Snapshot001 snapshot;
-			Check(api.GetSnapshot(api.context, &snapshot));
-			if ((action == "set_enabled" || action == "clear_history") && snapshot.capturing)
+			CaptureProgress001 current;
+			Check(service.GetCurrentCapture(api.context, &current));
+			if ((action == "set_enabled" || action == "clear_history") && current.state == CaptureState::kRunning)
 				throw ToolError(409, "A profiler capture is active");
 			if (action == "set_enabled") {
 				Check(api.SetEnabled(api.context, args.at("enabled").get<bool>() ? 1 : 0));
-				result = ReadSnapshot(api);
+				result = { { "enabled", args.at("enabled") } };
 			} else if (action == "clear_history") {
 				Check(api.ClearHistory(api.context));
 				result = { { "cleared", true } };
