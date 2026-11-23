@@ -1,6 +1,7 @@
 #include "ActorIdle.h"
 #include "Autorun.h"
 #include "BackgroundRun.h"
+#include "BuildProfile.h"
 #include "CameraOrbit.h"
 #include "Capture.h"
 #include "Config.h"
@@ -73,13 +74,13 @@ namespace
 	{
 		if (!a_msg)
 			return;
-		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame)
+		if (!dvb::PerformanceProfile && (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame))
 			dvb::CameraOrbit::EndSession();  // an orbit never carries into another game
-		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame)
+		if (!dvb::PerformanceProfile && (a_msg->type == SKSE::MessagingInterface::kPreLoadGame || a_msg->type == SKSE::MessagingInterface::kNewGame))
 			dvb::ActorIdle::EndSession();  // nor does an idle loop
-		if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame)
+		if (!dvb::PerformanceProfile && a_msg->type == SKSE::MessagingInterface::kPreLoadGame)
 			dvb::FreeCamera::BeginLoad();
-		else if (a_msg->type == SKSE::MessagingInterface::kNewGame || a_msg->type == SKSE::MessagingInterface::kPostLoadGame)
+		else if (!dvb::PerformanceProfile && (a_msg->type == SKSE::MessagingInterface::kNewGame || a_msg->type == SKSE::MessagingInterface::kPostLoadGame))
 			dvb::FreeCamera::EndLoad();
 		// Init at kPostLoad, not kDataLoaded: SKSE runs ALL plugins' kPostLoad before any
 		// kDataLoaded, so the cross-plugin interface is ready when consumer mods request it
@@ -89,7 +90,7 @@ namespace
 		if (a_msg->type == SKSE::MessagingInterface::kPostLoad) {
 			const dvb::Config cfg = dvb::LoadConfig();
 			ApplyLogLevel(cfg.logLevel);
-			if (cfg.disableVanityCamera)
+			if (!dvb::PerformanceProfile && cfg.disableVanityCamera)
 				dvb::VanityCamera::Install();  // independent of the server: the idle camera is a game setting
 			if (!cfg.enabled) {
 				logs::info("devbench: server disabled via config; not starting");
@@ -100,17 +101,19 @@ namespace
 				g_config = cfg;  // kept for kInputLoaded (input sink registers later)
 				g_server = new dvb::Server("127.0.0.1", cfg.port);
 				g_server->Events().SetFrameProvider(&dvb::game::CurrentFrame);
-				g_server->Tools().SetStrictArgs(cfg.strictToolArgs);
+				g_server->Tools().SetStrictArgs(dvb::PerformanceProfile || cfg.strictToolArgs);
 				dvb::RegisterCoreTools(g_server->Tools(), g_server->Events());
-				dvb::ModalWatch::Init(g_server->Tools(), g_server->Events(), cfg.autoDismissMenus);
-				dvb::Recording::SetLoadSettleMs(cfg.loadSettleMs);
-				dvb::Recording::SetDefaultIntervalMs(cfg.recordIntervalMs);
-				dvb::Recording::SetCoupling(cfg.couplingAnchorMs, cfg.couplingCellMs, cfg.cleanTransition, cfg.cleanTransitionCell);
-				dvb::Recording::SetCaptureDefaults(cfg.captureSettleMs);
-				dvb::Capture::SetEvents(&g_server->Events());
-				dvb::Capture::SetDefaults(cfg);
-				dvb::ArmAutoRun(g_server->Tools(), cfg.autoRunPath, cfg.autoRunRestoreScene);
-				dvb::HostApi::Init(g_server->Tools(), g_server->Events());
+				if constexpr (!dvb::PerformanceProfile) {
+					dvb::ModalWatch::Init(g_server->Tools(), g_server->Events(), cfg.autoDismissMenus);
+					dvb::Recording::SetLoadSettleMs(cfg.loadSettleMs);
+					dvb::Recording::SetDefaultIntervalMs(cfg.recordIntervalMs);
+					dvb::Recording::SetCoupling(cfg.couplingAnchorMs, cfg.couplingCellMs, cfg.cleanTransition, cfg.cleanTransitionCell);
+					dvb::Recording::SetCaptureDefaults(cfg.captureSettleMs);
+					dvb::Capture::SetEvents(&g_server->Events());
+					dvb::Capture::SetDefaults(cfg);
+					dvb::ArmAutoRun(g_server->Tools(), cfg.autoRunPath, cfg.autoRunRestoreScene);
+					dvb::HostApi::Init(g_server->Tools(), g_server->Events());
+				}
 				// Never let a throw here escape into SKSE's kPostLoad dispatch: that aborts the
 				// remaining listeners, silently leaving every later-loaded plugin without its
 				// kPostLoad (observed as other mods' API-dependent features vanishing, with the
@@ -133,22 +136,24 @@ namespace
 						logs::error("devbench: Stop() also failed");
 					}
 				}
-				dvb::InstallGameEvents(g_server->Events());
-				dvb::StallWatchdog::Start(g_server->Events(), cfg.stallWatchdogMs);
-				dvb::ConsoleHook::Install(g_server->Events());  // observe console commands as events / for recording
-				dvb::CameraOrbit::Install();                    // camera action='orbit' holds the gameplay camera round the player
-				dvb::ConsoleLogCapture::InstallPrintHook();     // every printed line reaches a console capture
+				dvb::InstallGameEvents(g_server->Events(), !dvb::PerformanceProfile);
+				if constexpr (!dvb::PerformanceProfile) {
+					dvb::StallWatchdog::Start(g_server->Events(), cfg.stallWatchdogMs);
+					dvb::ConsoleHook::Install(g_server->Events());  // observe console commands as events / for recording
+					dvb::CameraOrbit::Install();
+					dvb::ConsoleLogCapture::InstallPrintHook();
 
-				// Receive cross-plugin interface requests from ANY plugin (nullptr sender),
-				// so consumer mods' dispatches reach us (mirrors MergeMapper). Registered
-				// at kPostLoad, before consumers request at their kDataLoaded.
-				if (auto* m = SKSE::GetMessagingInterface())
-					m->RegisterListener(nullptr, OnInterfaceMessage);
+					// Receive cross-plugin interface requests from ANY plugin (nullptr sender),
+					// so consumer mods' dispatches reach us (mirrors MergeMapper). Registered
+					// at kPostLoad, before consumers request at their kDataLoaded.
+					if (auto* m = SKSE::GetMessagingInterface())
+						m->RegisterListener(nullptr, OnInterfaceMessage);
+				}
 			}
 		}
 		// Register input hotkeys at kInputLoaded — BSInputDeviceManager is null at kPostLoad,
 		// so registering then silently no-ops. kInputLoaded fires once the input subsystem is up.
-		if (a_msg->type == SKSE::MessagingInterface::kInputLoaded && g_server) {
+		if (a_msg->type == SKSE::MessagingInterface::kInputLoaded && g_server && !dvb::PerformanceProfile) {
 			dvb::MarkKeyboardInputReady();
 			dvb::MarkVRInputReady(g_server->Events());
 			dvb::InstallInputHotkeys(g_server->Tools(), g_config);
@@ -157,7 +162,7 @@ namespace
 		// Register the optional in-game menus at kDataLoaded (the frameworks are up by then). Each
 		// is inert if its framework isn't installed; both drive devbench via dvb::RunTool, so they
 		// need the server (g_server). SMF and FUCK are independent — host either, both, or neither.
-		if (a_msg->type == SKSE::MessagingInterface::kDataLoaded && g_server) {
+		if (a_msg->type == SKSE::MessagingInterface::kDataLoaded && g_server && !dvb::PerformanceProfile) {
 			if (g_config.alwaysActive) {
 				if (dvb::BackgroundRun::SetAlwaysActive(true))
 					logs::info("devbench: bAlwaysActive forced on (alwaysActive config)");
@@ -168,7 +173,9 @@ namespace
 			dvb::UI::RegisterFuck();
 		}
 
-		if (g_server) {
+		if (g_server && dvb::PerformanceProfile)
+			dvb::OnSKSEMessage(a_msg->type);
+		if (g_server && !dvb::PerformanceProfile) {
 			// Never carry a synthetic held key across a scene reset. This callback is on Skyrim's
 			// main thread, so the keyboard layer hands cleanup to a worker and returns immediately.
 			if (a_msg->type == SKSE::MessagingInterface::kPreLoadGame) {
@@ -179,7 +186,6 @@ namespace
 				dvb::ReleaseVRInputForLifecycle("newGame");
 			}
 
-			// Publish lifecycle events (dataLoaded and later load/save/new-game).
 			dvb::OnSKSEMessage(a_msg->type);
 			// Remember the save the player loaded or just wrote, so a recording started
 			// afterward can stamp a reproducible entry point — even when the user loaded via
@@ -211,8 +217,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
 	InitLogging();
-	SKSE::AllocTrampoline(1 << 10);
-	logs::info("devbench {} loaded", DEVBENCH_VERSION_STRING);
+	if constexpr (!dvb::PerformanceProfile)
+		SKSE::AllocTrampoline(1 << 10);
+	logs::info("devbench {} loaded ({} profile)", DEVBENCH_VERSION_STRING, dvb::BuildProfileName);
 
 	if (auto* messaging = SKSE::GetMessagingInterface())
 		messaging->RegisterListener(OnMessage);

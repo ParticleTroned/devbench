@@ -2,8 +2,10 @@
 #include "ActorIdle.h"
 #include "ActorIdleLogic.h"
 #include "BackgroundRun.h"
+#include "BuildProfile.h"
 #include "CameraFrameLogic.h"
 #include "CameraOrbit.h"
+#include "PerformanceTools.h"
 #include <RE/T/ThirdPersonState.h>
 
 #include "AssetInfo.h"
@@ -436,6 +438,17 @@ namespace dvb
 		// game: programmatic save / load / list. Named saves use SKSE's Game.SaveGame
 		// request; loads use BGSSaveLoadManager. loadLast gives a settled real-save
 		// state for testing WITHOUT coc's heavy new-game init. Both are async — see kLoadNote.
+		void QueueNamedLoad(const std::string& name)
+		{
+			if constexpr (PerformanceProfile)
+				LoadPerformanceSave(ToGame(name));
+			else
+				SKSE::GetTaskInterface()->AddTask([name = ToGame(name)] {
+					if (auto* manager = RE::BGSSaveLoadManager::GetSingleton())
+						manager->Load(name.c_str(), false);
+				});
+		}
+
 		json GameHandler(const json& a_args, const ToolContext& a_ctx)
 		{
 			const std::string action = a_args.value("action", std::string{});
@@ -663,11 +676,9 @@ namespace dvb
 				if (saves.empty())
 					throw ToolError(404, std::format("no .ess saves in {}", saveDir.string()));
 				const std::string name = saves.front().name;
-				Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
-				task->AddTask([name = ToGame(name)]() {
-					if (auto* m = RE::BGSSaveLoadManager::GetSingleton())
-						m->Load(name.c_str(), false);
-				});
+				if constexpr (!PerformanceProfile)
+					Recording::NoteLoadEntry(name);
+				QueueNamedLoad(name);
 				logs::info("devbench: game loadLast -> '{}'", name);
 				return json{ { "queued", true }, { "action", action }, { "name", name }, { "note", kLoadNote } };
 			}
@@ -687,19 +698,15 @@ namespace dvb
 					if (it == saves.end())
 						throw ToolError(404, std::format("save '{}' not found in {} — use action='list' for valid names", name, saveDir.string()));
 					file = it->name;
-					Recording::NoteLoadEntry(name);  // reproducible entry point for a later recording
+					if constexpr (!PerformanceProfile)
+						Recording::NoteLoadEntry(name);
 				}
 				if (isSave) {
 					// SKSE tasks can run on worker threads. Synchronous Save can deadlock
 					// against the main thread's VM lock, so use SKSE's save request.
 					Papyrus::QueueCall(json{ { "script", "Game" }, { "function", "SaveGame" }, { "args", json::array({ name }) } });
 				} else {
-					task->AddTask([file = ToGame(file)]() {
-						auto* m = RE::BGSSaveLoadManager::GetSingleton();
-						if (!m)
-							return;
-						m->Load(file.c_str(), false);  // checkForMods=false skips the mod-mismatch modal
-					});
+					QueueNamedLoad(file);
 				}
 				logs::info("devbench: game {} '{}'", action, name);
 				json out{ { "queued", true }, { "action", action }, { "name", name } };
@@ -3229,6 +3236,74 @@ namespace dvb
 		// inspect/menu descriptors are REBUILT (not frozen at startup) so registered keys appear in
 		// tools/list. RegisterCoreTools registers these initially; the ToolExtensions change-listener
 		// re-registers them when a mod adds a kind/menu (which also fires tools/list_changed).
+		ToolDescriptor BuildGameDescriptor()
+		{
+			ToolDescriptor game;
+			game.name = "game";
+			game.description =
+				"Save/load and list saves. action='list' returns { count, returned, truncated, saves: "
+				"[{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — "
+				"count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps "
+				"only names containing a substring (case-insensitive; save names embed the location, "
+				"e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' "
+				"object per matched save (characterName, location, race, level, experience, playTime, saveNumber, "
+				"saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from "
+				"the save's own .ess header, same bytes the vanilla Load menu shows, so it works even "
+				"before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; "
+				"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
+				"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
+				"confirmation modal). 'delete' (param 'name') removes that save through the engine's own "
+				"Delete (SE/AE only, irreversible) and reports the result. All other actions except 'list' are "
+				"fire-and-forget; watch lifecycle events / "
+				"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
+				"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
+				"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
+				"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
+				"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
+				"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
+				"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
+				"every request gets a 'generation' and one terminal snapshot { generation, state, requested, "
+				"effective, owner, leased, leaseRemainingMs, reached, applied, admissionMs, waitedMs }. state is "
+				"accepted (recorded, not yet handed to the engine), written (the engine has its value but is still "
+				"ramping toward it), reached, expired (its lease ran out) or displaced (a later request or a release "
+				"replaced it); applied = written or reached. It waits up to 'waitMs' (default 2000, 0..30000) after "
+				"admission for reached / expired / displaced; admissionMs and waitedMs are reported apart. A request "
+				"that has not reached is an answer, not an error, unless 'requireReached':true (504, the old "
+				"behaviour). It is refused (409) while a recording or a capture is "
+				"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns { requested, effective, owner, "
+				"leased, leaseRemainingMs } without changing anything. 'getDifficulty' returns { level, name } "
+				"(0 Novice .. 5 Legendary); 'setDifficulty' (param 'level': 0-5 or the name, any case) sets it "
+				"on the loaded player, as the Settings menu would, and returns the same read back. 'getAlwaysActive' / "
+				"'setAlwaysActive' (param 'enabled': boolean) read or set the engine's [General] bAlwaysActive live, so the game "
+				"keeps running while its window is in the background; the INI file is not changed. Both return "
+				"{ alwaysActive, windowFocused }. A main-thread task timeout includes details.taskStarted, "
+				"details.outcome ('unknown' or 'not_started') and details.retrySafe. Do not repeat a mutation "
+				"whose task started: it can still complete after the timeout.";
+			game.inputSchema = json{
+				{ "type", "object" },
+				{ "properties", json{
+									{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "delete", "advanceTime", "getTimeScale", "setTimeScale", "getDifficulty", "setDifficulty", "getAlwaysActive", "setAlwaysActive" }) }, { "description", "list | save | load | loadLast | delete | advanceTime | getTimeScale | setTimeScale | getDifficulty | setDifficulty | getAlwaysActive | setAlwaysActive" } } },
+									{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load/delete; from action='list')" } } },
+									{ "save", json{ { "type", "string" }, { "description", "alias for name" } } },
+									{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath; delete does not take it)" } } },
+									{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
+									{ "limit", json{ { "type", "integer" }, { "description", "list only: cap the number of saves returned (newest-first); must be > 0 if given" } } },
+									{ "detail", json{ { "type", "boolean" }, { "description", "list only: add per-save character/location/level metadata (default false)" } } },
+									{ "hours", json{ { "type", "number" }, { "description", "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)" } } },
+									{ "scale", json{ { "type", "number" }, { "description", "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)" } } },
+									{ "holdMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)" } } },
+									{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
+									{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
+									{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
+									{ "waitMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long to wait, after admission, for this request to settle (reached, expired or displaced) before answering (default 2000, 0..30000)" } } },
+									{ "enabled", json{ { "type", "boolean" }, { "description", "setAlwaysActive: keep the game running while its window is in the background" } } },
+									{ "level", json{ { "description", "setDifficulty: 0-5 (Novice, Apprentice, Adept, Expert, Master, Legendary) or the level name, any case" } } },
+									{ "requireReached", json{ { "type", "boolean" }, { "description", "setTimeScale: answer 504 when the request has not reached the engine within waitMs, as before waitMs existed (default false: answer with its state)" } } },
+								} },
+			};
+			return game;
+		}
+
 		ToolDescriptor BuildInspectDescriptor()
 		{
 			ToolDescriptor inspect;
@@ -3377,6 +3452,10 @@ namespace dvb
 	/// Register built-in handlers and their shared REST/MCP discovery contracts.
 	void RegisterCoreTools(ToolRegistry& a_registry, EventBus& a_events)
 	{
+		if constexpr (PerformanceProfile) {
+			RegisterPerformanceTools(a_registry, BuildGameDescriptor(), GameHandler, BuildInspectDescriptor(), InspectHandler);
+			return;
+		}
 		RegisterInputTool(a_registry, a_events);
 
 		ToolDescriptor console;
@@ -3413,68 +3492,7 @@ namespace dvb
 		};
 		a_registry.Register(std::move(console), &ConsoleHandler);
 
-		ToolDescriptor game;
-		game.name = "game";
-		game.description =
-			"Save/load and list saves. action='list' returns { count, returned, truncated, saves: "
-			"[{name, mtimeUnix}, ...] }, sorted newest-first (saves[0] is what 'loadLast' loads) — "
-			"count is post-filter (how many matched), returned/saves are post-limit. 'filter' keeps "
-			"only names containing a substring (case-insensitive; save names embed the location, "
-			"e.g. 'Whiterun'), 'limit' caps how many are returned, 'detail'=true adds a 'meta' "
-			"object per matched save (characterName, location, race, level, experience, playTime, saveNumber, "
-			"saveType [inferred from the filename], screenshot, fileTimeUnix — read directly from "
-			"the save's own .ess header, same bytes the vanilla Load menu shows, so it works even "
-			"before anything has loaded) plus top-level metaAvailable/metaNote if none parsed; "
-			"'loadLast' loads the most recent save (a settled real-game state — avoids coc's "
-			"heavy new-game init); 'load'/'save' take a 'name' ('load' skips the mod-mismatch "
-			"confirmation modal). 'delete' (param 'name') removes that save through the engine's own "
-			"Delete (SE/AE only, irreversible) and reports the result. All other actions except 'list' are "
-			"fire-and-forget; watch lifecycle events / "
-			"inspect playerLoaded for completion. 'advanceTime' (param 'hours', non-zero, may be "
-			"negative) jumps the calendar directly — no need to fall back to console 'set timescale "
-			"to N' and waiting real time — and returns { gameHour, daysPassed, day, month, year } "
-			"read back the same tick; runs synchronously on the main thread. 'setTimeScale' (param "
-			"'scale', or 'freeze':true for 0) speeds up or slows down the game itself for "
-			"'holdMs' (default 60000) — which is what makes a replay or scenario run faster in wall "
-			"time — then restores the previous scale; 0.1..3.0, up to 10.0 with 'allowHigh':true, and "
-			"every request gets a 'generation' and one terminal snapshot { generation, state, requested, "
-			"effective, owner, leased, leaseRemainingMs, reached, applied, admissionMs, waitedMs }. state is "
-			"accepted (recorded, not yet handed to the engine), written (the engine has its value but is still "
-			"ramping toward it), reached, expired (its lease ran out) or displaced (a later request or a release "
-			"replaced it); applied = written or reached. It waits up to 'waitMs' (default 2000, 0..30000) after "
-			"admission for reached / expired / displaced; admissionMs and waitedMs are reported apart. A request "
-			"that has not reached is an answer, not an error, unless 'requireReached':true (504, the old "
-			"behaviour). It is refused (409) while a recording or a capture is "
-			"in flight, unless 'allowTimeScale':true. 'getTimeScale' returns { requested, effective, owner, "
-			"leased, leaseRemainingMs } without changing anything. 'getDifficulty' returns { level, name } "
-			"(0 Novice .. 5 Legendary); 'setDifficulty' (param 'level': 0-5 or the name, any case) sets it "
-			"on the loaded player, as the Settings menu would, and returns the same read back. 'getAlwaysActive' / "
-			"'setAlwaysActive' (param 'enabled': boolean) read or set the engine's [General] bAlwaysActive live, so the game "
-			"keeps running while its window is in the background; the INI file is not changed. Both return "
-			"{ alwaysActive, windowFocused }.";
-		game.inputSchema = json{
-			{ "type", "object" },
-			{ "properties", json{
-								{ "action", json{ { "type", "string" }, { "enum", json::array({ "list", "save", "load", "loadLast", "delete", "advanceTime", "getTimeScale", "setTimeScale", "getDifficulty", "setDifficulty", "getAlwaysActive", "setAlwaysActive" }) }, { "description", "list | save | load | loadLast | delete | advanceTime | getTimeScale | setTimeScale | getDifficulty | setDifficulty | getAlwaysActive | setAlwaysActive" } } },
-								{ "name", json{ { "type", "string" }, { "description", "save file name (required for save/load/delete; from action='list')" } } },
-								{ "save", json{ { "type", "string" }, { "description", "alias for name" } } },
-								{ "dir", json{ { "type", "string" }, { "description", "list/load/loadLast: override the saves directory (default resolves from sLocalSavePath; delete does not take it)" } } },
-								{ "filter", json{ { "type", "string" }, { "description", "list only: case-insensitive substring to match against save names" } } },
-								{ "limit", json{ { "type", "integer" }, { "description", "list only: cap the number of saves returned (newest-first); must be > 0 if given" } } },
-								{ "detail", json{ { "type", "boolean" }, { "description", "list only: add per-save character/location/level metadata (default false)" } } },
-								{ "hours", json{ { "type", "number" }, { "description", "advanceTime: hours to add to the calendar (non-zero; negative rewinds within the current session)" } } },
-								{ "scale", json{ { "type", "number" }, { "description", "setTimeScale: game speed multiplier, 0.1..3.0 (0 freezes, and needs freeze:true)" } } },
-								{ "holdMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long the scale stays in effect before the previous scale is restored (default 60000, max 3600000)" } } },
-								{ "freeze", json{ { "type", "boolean" }, { "description", "setTimeScale: confirm scale 0 (freeze); required with a 0 scale" } } },
-								{ "allowHigh", json{ { "type", "boolean" }, { "description", "setTimeScale: permit a scale above 3.0, up to 10.0" } } },
-								{ "allowTimeScale", json{ { "type", "boolean" }, { "description", "setTimeScale: change the scale even while a recording or capture is in flight (default false)" } } },
-								{ "waitMs", json{ { "type", "integer" }, { "description", "setTimeScale: how long to wait, after admission, for this request to settle (reached, expired or displaced) before answering (default 2000, 0..30000)" } } },
-								{ "enabled", json{ { "type", "boolean" }, { "description", "setAlwaysActive: keep the game running while its window is in the background" } } },
-								{ "level", json{ { "description", "setDifficulty: 0-5 (Novice, Apprentice, Adept, Expert, Master, Legendary) or the level name, any case" } } },
-								{ "requireReached", json{ { "type", "boolean" }, { "description", "setTimeScale: answer 504 when the request has not reached the engine within waitMs, as before waitMs existed (default false: answer with its state)" } } },
-							} },
-		};
-		a_registry.Register(std::move(game), &GameHandler);
+		a_registry.Register(BuildGameDescriptor(), &GameHandler);
 
 		ToolDescriptor actor;
 		actor.name = "actor";

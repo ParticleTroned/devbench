@@ -38,6 +38,12 @@ set_showmenu(true)
 set_description("Metadata appended to the reported runtime version for local builds")
 option_end()
 
+option("performance_profile")
+set_default(false)
+set_showmenu(true)
+set_description("Build the minimal production-CSX performance adapter")
+option_end()
+
 -- packages
 add_requires("nlohmann_json")
 -- Decode-only image loading for the `capture` tool's native SSIM comparison (two already-
@@ -88,7 +94,12 @@ target_end()
 
 -- target
 target("devbench")
-add_deps("commonlibsse-ng", "cpp-mcp", "devbench-UI", "devbench-UI-fuck")
+add_deps("commonlibsse-ng", "cpp-mcp")
+if has_config("performance_profile") then
+    add_defines("DEVBENCH_PERFORMANCE_PROFILE")
+else
+    add_deps("devbench-UI", "devbench-UI-fuck")
+end
 add_packages("nlohmann_json", "stb")
 
 -- DLL output name
@@ -117,6 +128,9 @@ on_load(function(target)
     import("fork_version", { rootdir = path.join(os.projectdir(), "scripts") })
     local fork_version, development_suffix = fork_version(os.projectdir())
     local version_string = target:version() .. "+pt." .. fork_version .. development_suffix
+    if config.get("performance_profile") then
+        version_string = version_string .. ".performance"
+    end
     local build_label = config.get("build_label")
     if build_label and build_label ~= "" then
         if not build_label:match("^[%w.%-]+$") then
@@ -185,8 +199,9 @@ set_kind("binary")
 set_default(false)
 set_languages("c++23")
 add_packages("nlohmann_json", "stb")
-add_includedirs("src")
+add_includedirs("src", "include")
 add_files("tests/*.cpp")
+add_files("src/CsxProfilerClient.cpp")
 add_deps("cpp-mcp", { inherit = false })
 add_includedirs("tests/mcp", "build/cpp-mcp-patched/include")
 add_files("src/McpAdapter.cpp") -- real adapter against a notification-capturing server
